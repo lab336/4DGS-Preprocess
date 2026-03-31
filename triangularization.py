@@ -36,11 +36,12 @@ class Config:
     min_confidence: float = 0.1              # RoMa overlap 置信度过滤阈值
     ransac_threshold: float = 1.0            # RANSAC 阈值 (像素，严格提高可靠性)
     reproj_threshold: float = 2.0            # 逐对重投影误差阈值 (像素，严格)
+    epipolar_threshold: float = 2.0          # 极线距离阈值 (像素，用已知位姿计算)
     max_depth: float = 100.0                 # 三角化最大深度
     min_depth: float = 0.05                  # 三角化最小深度
-    min_angle: float = 1.5                   # 最小三角化角度 (度)，过滤退化三角化
-    min_observations: int = 2                # 点至少被多少个视图对独立三角化
-    min_visible_views: int = 3               # 多视角可见性：至少被 N 个相机看到
+    min_angle: float = 1.0                   # 最小三角化角度 (度)，降低以保留花瓣
+    min_observations: int = 1                # 点至少被多少个视图对独立三角化 (1=单对也接受)
+    min_visible_views: int = 2               # 多视角可见性：至少被 2 个相机看到
     neighbor_range: int = 3                  # 每个相机与前后 N 个邻居配对
     sor_k: int = 10                          # 统计离群值去除 - 近邻数
     sor_std: float = 3.0                     # 统计离群值去除 - 标准差倍数
@@ -114,6 +115,42 @@ def scale_intrinsics(K: np.ndarray, colmap_w: int, colmap_h: int,
 
 
 # ======================== 三角化与过滤 ========================
+
+def compute_fundamental_from_poses(K1, R1, t1, K2, R2, t2):
+    """从已知相机位姿直接计算 Fundamental Matrix。
+
+    这比 RANSAC 估计 E 矩阵更可靠，因为：
+    - 不会被背景主导，花瓣等小物体不会被当作 outlier
+    - 所有深度的点都满足同一个极线约束
+    """
+    R_rel = R2 @ R1.T
+    t_rel = t2 - R_rel @ t1
+    tx = np.array([[0, -t_rel[2], t_rel[1]],
+                   [t_rel[2], 0, -t_rel[0]],
+                   [-t_rel[1], t_rel[0], 0]], dtype=np.float64)
+    E = tx @ R_rel
+    F = np.linalg.inv(K2).T @ E @ np.linalg.inv(K1)
+    return F
+
+
+def epipolar_filter(pts1, pts2, F, threshold):
+    """用已知 F 矩阵做极线距离过滤。
+
+    Sampson 距离：综合考虑两个方向的极线距离，比单侧更鲁棒。
+    优势：不会像 RANSAC 那样被背景主导，花瓣等小物体不会被误删。
+    """
+    n = len(pts1)
+    p1h = np.hstack([pts1, np.ones((n, 1))])  # Nx3
+    p2h = np.hstack([pts2, np.ones((n, 1))])
+    Fp1 = (F @ p1h.T).T       # Nx3: 极线 in image2
+    Ftp2 = (F.T @ p2h.T).T    # Nx3: 极线 in image1
+    # p2^T F p1
+    pfp = np.sum(p2h * Fp1, axis=1)
+    # Sampson distance
+    denom = Fp1[:, 0]**2 + Fp1[:, 1]**2 + Ftp2[:, 0]**2 + Ftp2[:, 1]**2
+    sampson = pfp**2 / (denom + 1e-12)
+    return sampson < threshold**2
+
 
 def triangulate_points(K1, R1, t1, K2, R2, t2, pts1, pts2):
     """从两个视角三角化三维点。"""
@@ -250,16 +287,37 @@ def multiview_color_blend(pts3d, valid_images, K_cache, images_info,
 
 # ======================== 点云去噪 ========================
 
-def statistical_outlier_removal(points, colors, k=20, std_mul=2.0):
-    """统计离群值去除：剔除到 k 近邻平均距离异常大的点。"""
+def statistical_outlier_removal(points, colors, k=10, std_mul=3.0):
+    """统计离群值去除，保护稀疏簇（花瓣）。
+
+    策略：先识别稀疏点（近邻距离 > 75th percentile 的 3 倍），
+    在密集区域做 SOR，稀疏点全部保留。
+    这样浮在空中的花瓣不会被删除。
+    """
     if len(points) < k + 1:
         return points, colors
     tree = cKDTree(points)
     dists, _ = tree.query(points, k=k + 1)
     mean_d = dists[:, 1:].mean(axis=1)
-    thr = mean_d.mean() + std_mul * mean_d.std()
-    mask = mean_d < thr
-    return points[mask], colors[mask]
+
+    # 识别稀疏点：近邻距离远超过典型值的点是漂浮物（花瓣）
+    p75 = np.percentile(mean_d, 75)
+    is_sparse = mean_d > p75 * 3.0  # 孤立的稀疏点
+
+    # 只对密集区域做 SOR
+    dense_mask = ~is_sparse
+    if dense_mask.sum() > k + 1:
+        dense_mean = mean_d[dense_mask]
+        thr = dense_mean.mean() + std_mul * dense_mean.std()
+        # 密集区域内超过阈值的点删除
+        dense_outlier = dense_mask & (mean_d > thr)
+        keep = ~dense_outlier
+    else:
+        keep = np.ones(len(points), dtype=bool)
+
+    # 稀疏点全部保留
+    keep[is_sparse] = True
+    return points[keep], colors[keep]
 
 
 # ======================== 密度感知降采样 ========================
@@ -421,18 +479,14 @@ def process_frame(frame_id, frame_dir, cameras, images_info, model, cfg):
         if n_match < 8:
             continue
 
-        E, emask = cv2.findEssentialMat(
-            pts_i, pts_j, Ki,
-            method=cv2.USAC_MAGSAC, prob=0.999999,
-            threshold=cfg.ransac_threshold, maxIters=10000,
-        )
-        if emask is None:
-            continue
-        emask = emask.ravel().astype(bool)
-        n_inlier = int(emask.sum())
+        # 用已知位姿计算 Fundamental Matrix，用极线距离过滤
+        # 不用 RANSAC —— 避免背景主导导致花瓣匹配被报废
+        F = compute_fundamental_from_poses(Ki, Ri, ti, Kj, Rj, tj)
+        epi_mask = epipolar_filter(pts_i, pts_j, F, cfg.epipolar_threshold)
+        in_i, in_j = pts_i[epi_mask], pts_j[epi_mask]
+        n_inlier = len(in_i)
         if n_inlier < 10:
             continue
-        in_i, in_j = pts_i[emask], pts_j[emask]
 
         pts3d = triangulate_points(Ki, Ri, ti, Kj, Rj, tj, in_i, in_j)
 
@@ -522,16 +576,18 @@ def main():
     parser.add_argument("--min_confidence", type=float, default=0.1,
                         help="最小 overlap 置信度")
     parser.add_argument("--ransac_threshold", type=float, default=1.0,
-                        help="RANSAC 阈值 (像素)")
+                        help="RANSAC 阈值 (像素，备用)")
     parser.add_argument("--reproj_threshold", type=float, default=2.0,
                         help="逐对重投影误差阈值 (像素)")
+    parser.add_argument("--epipolar_threshold", type=float, default=2.0,
+                        help="极线距离阈值 (像素)")
     parser.add_argument("--max_depth", type=float, default=100.0,
                         help="最大深度")
-    parser.add_argument("--min_angle", type=float, default=1.5,
+    parser.add_argument("--min_angle", type=float, default=1.0,
                         help="最小三角化角度 (度)")
-    parser.add_argument("--min_observations", type=int, default=2,
+    parser.add_argument("--min_observations", type=int, default=1,
                         help="点至少被多少对相机独立三角化")
-    parser.add_argument("--min_visible_views", type=int, default=3,
+    parser.add_argument("--min_visible_views", type=int, default=2,
                         help="点至少被多少个相机看到")
     parser.add_argument("--sor_k", type=int, default=10,
                         help="SOR 近邻数")
@@ -549,6 +605,7 @@ def main():
         min_confidence=args.min_confidence,
         ransac_threshold=args.ransac_threshold,
         reproj_threshold=args.reproj_threshold,
+        epipolar_threshold=args.epipolar_threshold,
         max_depth=args.max_depth,
         min_angle=args.min_angle,
         min_observations=args.min_observations,
