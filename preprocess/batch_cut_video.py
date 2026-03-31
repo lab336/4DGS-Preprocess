@@ -1,51 +1,80 @@
 """
-批量提取视频帧脚本
+批量提取视频帧脚本（多进程加速版）
 
 输出目录结构：
   output/
   ├── by_video/          # 同一视频的帧放在同一子文件夹（按帧序号 1,2,3... 命名）
-  │   ├── 001/
+  │   ├── video_name/
   │   │   ├── 1.jpg
-  │   │   ├── 2.jpg
   │   │   └── ...
   │   └── ...
   └── by_frame/          # 同一帧序号的图片放在同一子文件夹（按视频序号 1,2,3... 命名）
       ├── 1/
       │   ├── 1.jpg
-      │   ├── 2.jpg
       │   └── ...
       └── ...
 
 超参数：
-  --data_dir    : 视频所在目录，默认 ../data
-  --output_dir  : 输出目录，默认 ../output
-  --num_frames  : 每个视频提取多少帧，默认 0（0 表示提取全部帧）
+  --data_dir    : 视频所在目录，默认 video
+  --output_dir  : 输出目录，默认 output
+  --num_frames  : 每个视频提取多少帧，默认 0（0 表示全部）
+  --target_fps  : 目标帧率，如视频 120fps 设为 30 则每秒取 30 帧（默认 0 = 不限）
+  --sample_mode : 采样方式：uniform / head（默认 uniform）
   --ext         : 视频文件扩展名过滤，默认 .mp4
+  --output_mode : 输出组织方式：by_video / by_frame / both（默认 by_frame）
+  --workers     : 并行进程数，默认 CPU 核数 / 2
+  --use_seek    : 启用 seek 快速跳帧（稀疏采样时极大提速，默认关闭）
+
+优先级：先按 target_fps 降采样，再按 num_frames 限制总帧数。
 """
 
 import os
 import argparse
 import cv2
 import numpy as np
+import multiprocessing
 
 # 抑制 GStreamer / OpenCV 无关警告
 os.environ["GST_DEBUG"] = "0"
 os.environ["OPENCV_LOG_LEVEL"] = "SILENT"
 
 
-def get_sample_indices(total_frames: int, num_frames: int, sample_mode: str):
+# ─────────────────────────── 工具函数 ───────────────────────────
+
+def get_sample_indices(total_frames: int, num_frames: int, sample_mode: str,
+                       original_fps: float = 0, target_fps: float = 0):
     """
-    返回要提取的帧索引集合（0-based）。
-    num_frames == 0 时返回 None（表示提取全部，无需查表）；
-    sample_mode=uniform 时均匀采样 num_frames 帧；
-    sample_mode=head 时严格提取前 num_frames 帧。
+    计算要提取的帧索引（0-based 有序列表），或 None 表示全部帧。
+    处理顺序：先按 target_fps 做时间降采样，再按 num_frames 限制总数。
     """
-    if num_frames == 0 or num_frames >= total_frames:
-        return None  # None 表示全部
-    if sample_mode == "head":
-        return set(range(num_frames))
-    indices = np.linspace(0, total_frames - 1, num_frames, dtype=int)
-    return set(indices.tolist())
+    # ── Step 1：按 target_fps 降采样 ──────────────────────────────────
+    if target_fps > 0 and original_fps > 0 and target_fps < original_fps:
+        step = original_fps / target_fps
+        candidates = []
+        pos = 0.0
+        while True:
+            idx = int(round(pos))
+            if idx >= total_frames:
+                break
+            candidates.append(idx)
+            pos += step
+        # 去重（浮点舍入可能产生相邻重复）
+        indices = sorted(set(candidates))
+    else:
+        indices = None  # None = 全部帧
+
+    # ── Step 2：按 num_frames 截取 ────────────────────────────────────
+    if num_frames > 0:
+        pool = indices if indices is not None else list(range(total_frames))
+        if num_frames >= len(pool):
+            return indices  # 已经足够少
+        if sample_mode == "head":
+            return pool[:num_frames]
+        # uniform
+        sel = np.linspace(0, len(pool) - 1, num_frames, dtype=int)
+        return [pool[i] for i in sel]
+
+    return indices
 
 
 def open_video(video_path: str):
@@ -57,73 +86,160 @@ def open_video(video_path: str):
     return cv2.VideoCapture(video_path)
 
 
-def process_video(video_path: str, video_idx: int, video_name: str,
-                  bv_subdir: str, by_frame_dir: str,
-                  num_frames: int, sample_mode: str, total_videos: int):
-    """
-    顺序读取视频，遇到需要的帧立即写盘（不缓存到内存）。
-    sample_set 在拿到真实 total 后再计算，避免 probe 失败导致误判。
-    """
+def _probe_video(video_path: str):
+    """快速探测视频的帧数和帧率（不解码）。"""
     cap = open_video(video_path)
     if not cap.isOpened():
-        print(f"  [跳过] 无法打开：{os.path.basename(video_path)}")
+        return 0, 0.0
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps   = cap.get(cv2.CAP_PROP_FPS)
+    cap.release()
+    return total, fps
+
+
+def _write_safe(path: str, frame) -> None:
+    """写盘辅助：异常时打印警告而非崩溃整个进程。"""
+    try:
+        cv2.imwrite(path, frame)
+    except Exception as exc:
+        print(f"\n  [警告] 写盘失败 {path}: {exc}", flush=True)
+
+
+# ─────────────────────────── 单视频处理（多进程 worker） ───────────────────────────
+
+def process_video(task: dict) -> int:
+    """
+    处理一个视频：解码 + 写盘。
+    速度优化：
+      - 不需要的帧只调 grab()（仅 demux，跳过解码），需要的帧调 grab()+retrieve()。
+      - seek 模式直接定位目标帧，跳过大段无用数据。
+    """
+    video_path   = task["video_path"]
+    video_idx    = task["video_idx"]
+    bv_subdir    = task["bv_subdir"]
+    by_frame_dir = task["by_frame_dir"]
+    num_frames   = task["num_frames"]
+    target_fps   = task["target_fps"]
+    sample_mode  = task["sample_mode"]
+    total_videos = task["total_videos"]
+    output_mode  = task["output_mode"]
+    use_seek     = task["use_seek"]
+
+    try:
+        cap = open_video(video_path)
+        if not cap.isOpened():
+            print(f"  [跳过] 无法打开：{os.path.basename(video_path)}", flush=True)
+            return 0
+
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps   = cap.get(cv2.CAP_PROP_FPS)
+        indices = get_sample_indices(total, num_frames, sample_mode, fps, target_fps)
+        actual  = total if indices is None else len(indices)
+
+        extra = ""
+        if target_fps > 0 and fps > 0:
+            extra = f"  原始fps={fps:.1f}  目标fps={target_fps}"
+        print(f"[{video_idx:03d}/{total_videos}] {os.path.basename(video_path)}"
+              f"  总帧数={total}  提取={actual}{extra}", flush=True)
+
+        need_bv      = output_mode in ("by_video", "both")
+        need_bf      = output_mode in ("by_frame", "both")
+        report_every = max(1, actual // 20)
+        frame_count  = 0
+
+        # ── Seek 模式：直接跳到目标帧 ────────────────────────────────────
+        if use_seek and indices is not None:
+            for frame_seq, raw_idx in enumerate(indices, start=1):
+                cap.set(cv2.CAP_PROP_POS_FRAMES, int(raw_idx))
+                ret, frame = cap.read()
+                if not ret:
+                    continue
+                if need_bv:
+                    _write_safe(os.path.join(bv_subdir, f"{frame_seq}.jpg"), frame)
+                if need_bf:
+                    _write_safe(os.path.join(by_frame_dir, str(frame_seq),
+                                             f"{video_idx}.jpg"), frame)
+                frame_count = frame_seq
+                if frame_seq % report_every == 0 or frame_seq == actual:
+                    print(f"  [{video_idx:03d}] 进度：{frame_seq}/{actual} 帧",
+                          end="\r", flush=True)
+
+        # ── 顺序模式：grab() 跳帧 + retrieve() 解码目标帧 ───────────────
+        else:
+            sample_set = set(indices) if indices is not None else None
+            raw_idx    = 0
+            # head 模式的最大原始索引，用于提前退出
+            max_raw = max(indices) if indices is not None else total - 1
+            while True:
+                if sample_set is not None and frame_count >= len(sample_set):
+                    break
+
+                need_this_frame = (sample_set is None or raw_idx in sample_set)
+
+                if need_this_frame:
+                    # grab + retrieve：完整解码
+                    if not cap.grab():
+                        break
+                    ret, frame = cap.retrieve()
+                    if not ret:
+                        break
+                    frame_count += 1
+                    if need_bv:
+                        _write_safe(os.path.join(bv_subdir, f"{frame_count}.jpg"), frame)
+                    if need_bf:
+                        _write_safe(os.path.join(by_frame_dir, str(frame_count),
+                                                 f"{video_idx}.jpg"), frame)
+                    if frame_count % report_every == 0 or frame_count == actual:
+                        print(f"  [{video_idx:03d}] 进度：{frame_count}/{actual} 帧",
+                              end="\r", flush=True)
+                else:
+                    # grab() 仅 demux，不做完整解码，比 read() 快很多
+                    if not cap.grab():
+                        break
+
+                # 已经超过最后需要的帧，提前退出
+                if raw_idx >= max_raw:
+                    break
+                raw_idx += 1
+
+        cap.release()
+        print(f"  [{video_idx:03d}] 完成：共写出 {frame_count} 帧{' ' * 20}", flush=True)
+        return frame_count
+
+    except Exception as exc:
+        print(f"\n  [{video_idx:03d}] 错误：{exc}", flush=True)
+        import traceback
+        traceback.print_exc()
         return 0
 
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    # 用真实 total 计算采样集合
-    sample_set = get_sample_indices(total, num_frames, sample_mode)
-    actual = total if sample_set is None else len(sample_set)
-    print(f"[{video_idx:03d}/{total_videos}] {os.path.basename(video_path)}"
-          f"  总帧数={total}  提取={actual}")
-
-    frame_seq = 0   # 本视频已写出的帧计数（1-based 序号）
-    raw_idx = 0     # 当前读到第几帧（0-based）
-    report_every = max(1, actual // 20)  # 每完成 5% 打印一次
-
-    while True:
-        # head 模式：已写够直接停止，无需读完整个视频
-        if sample_set is not None and frame_seq >= len(sample_set):
-            break
-
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        if sample_set is None or raw_idx in sample_set:
-            frame_seq += 1
-
-            # by_video：视频名子目录，帧序号命名
-            cv2.imwrite(os.path.join(bv_subdir, f"{frame_seq}.jpg"), frame)
-
-            # by_frame：帧序号子目录，视频序号命名
-            bf_subdir = os.path.join(by_frame_dir, str(frame_seq))
-            os.makedirs(bf_subdir, exist_ok=True)
-            cv2.imwrite(os.path.join(bf_subdir, f"{video_idx}.jpg"), frame)
-
-            if frame_seq % report_every == 0 or frame_seq == actual:
-                print(f"  进度：{frame_seq}/{actual} 帧", end="\r", flush=True)
-
-        raw_idx += 1
-
-    cap.release()
-    print(f"  完成：共写出 {frame_seq} 帧{' ' * 20}")
-    return frame_seq
-
+# ─────────────────────────── 主入口 ───────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="批量提取视频帧")
-    parser.add_argument("--data_dir",   type=str, default="video",   help="视频所在目录")
-    parser.add_argument("--output_dir", type=str, default="output", help="输出根目录")
-    parser.add_argument("--num_frames", type=int, default=0,        help="每视频提取帧数（0=全部）")
-    parser.add_argument(
-        "--sample_mode",
-        type=str,
-        default="uniform",
-        choices=["uniform", "head"],
-        help="采样方式：uniform=均匀采样，head=严格前N帧",
-    )
-    parser.add_argument("--ext",        type=str, default=".mp4",   help="视频文件扩展名")
+    cpu_count       = multiprocessing.cpu_count()
+    default_workers = max(1, cpu_count // 2)
+
+    parser = argparse.ArgumentParser(description="批量提取视频帧（多进程加速版）")
+    parser.add_argument("--data_dir",    type=str, default="video",
+                        help="视频所在目录")
+    parser.add_argument("--output_dir",  type=str, default="output",
+                        help="输出根目录")
+    parser.add_argument("--num_frames",  type=int, default=0,
+                        help="每视频提取帧数（0=全部）")
+    parser.add_argument("--target_fps",  type=float, default=30,
+                        help="目标帧率（如原始120fps设30则每秒取30帧，0=不限）")
+    parser.add_argument("--sample_mode", type=str, default="uniform",
+                        choices=["uniform", "head"],
+                        help="采样方式：uniform=均匀采样，head=严格前N帧")
+    parser.add_argument("--ext",         type=str, default=".mp4",
+                        help="视频文件扩展名")
+    parser.add_argument("--output_mode", type=str, default="by_frame",
+                        choices=["by_video", "by_frame", "both"],
+                        help="输出组织方式：by_video / by_frame / both（默认 by_frame）")
+    parser.add_argument("--workers",     type=int, default=default_workers,
+                        help=f"并行处理视频的进程数（默认 {default_workers}）")
+    parser.add_argument("--use_seek",    action="store_true",
+                        help="启用 seek 快速跳帧（稀疏采样时显著提速，默认关闭）")
     args = parser.parse_args()
 
     data_dir   = os.path.abspath(args.data_dir)
@@ -139,26 +255,67 @@ def main():
 
     by_video_dir = os.path.join(output_dir, "by_video")
     by_frame_dir = os.path.join(output_dir, "by_frame")
-    os.makedirs(by_video_dir, exist_ok=True)
-    os.makedirs(by_frame_dir, exist_ok=True)
+    if args.output_mode in ("by_video", "both"):
+        os.makedirs(by_video_dir, exist_ok=True)
+    if args.output_mode in ("by_frame", "both"):
+        os.makedirs(by_frame_dir, exist_ok=True)
 
-    print(f"共找到 {len(video_files)} 个视频，开始提取帧...\n")
+    # ── 预建所有子目录（主进程统一创建，worker 内不调用 makedirs）──────────
+    if args.output_mode in ("by_video", "both"):
+        for filename in video_files:
+            os.makedirs(os.path.join(by_video_dir, os.path.splitext(filename)[0]),
+                        exist_ok=True)
 
-    for video_idx, filename in enumerate(video_files, start=1):
-        video_path = os.path.join(data_dir, filename)
-        video_name = os.path.splitext(filename)[0]
+    if args.output_mode in ("by_frame", "both"):
+        print("预扫描视频帧数以提前建立目录...")
+        max_frames = 0
+        for filename in video_files:
+            total, fps = _probe_video(os.path.join(data_dir, filename))
+            if total > 0:
+                indices = get_sample_indices(total, args.num_frames, args.sample_mode,
+                                             fps, args.target_fps)
+                needed = total if indices is None else len(indices)
+                max_frames = max(max_frames, needed)
+        print(f"预建 by_frame 子目录（共 {max_frames} 个）...")
+        for i in range(1, max_frames + 1):
+            os.makedirs(os.path.join(by_frame_dir, str(i)), exist_ok=True)
 
-        bv_subdir = os.path.join(by_video_dir, video_name)
-        os.makedirs(bv_subdir, exist_ok=True)
+    # ── 构造任务列表 ───────────────────────────────────────────────────────────
+    tasks = [
+        {
+            "video_path":   os.path.join(data_dir, filename),
+            "video_idx":    idx,
+            "video_name":   os.path.splitext(filename)[0],
+            "bv_subdir":    os.path.join(by_video_dir, os.path.splitext(filename)[0]),
+            "by_frame_dir": by_frame_dir,
+            "num_frames":   args.num_frames,
+            "target_fps":   args.target_fps,
+            "sample_mode":  args.sample_mode,
+            "total_videos": len(video_files),
+            "output_mode":  args.output_mode,
+            "use_seek":     args.use_seek,
+        }
+        for idx, filename in enumerate(video_files, start=1)
+    ]
 
-        process_video(video_path, video_idx, video_name,
-                      bv_subdir, by_frame_dir,
-                      args.num_frames, args.sample_mode, len(video_files))
+    workers = min(args.workers, len(video_files))
+    print(f"共找到 {len(video_files)} 个视频，启用 {workers} 进程并行处理...\n")
+
+    if workers <= 1:
+        for task in tasks:
+            process_video(task)
+    else:
+        with multiprocessing.Pool(processes=workers) as pool:
+            pool.map(process_video, tasks)
 
     print("\n全部完成！")
-    print(f"  按视频组织：{by_video_dir}")
-    print(f"  按帧序号组织：{by_frame_dir}")
+    if args.output_mode in ("by_video", "both"):
+        print(f"  按视频组织：{by_video_dir}")
+    if args.output_mode in ("by_frame", "both"):
+        print(f"  按帧序号组织：{by_frame_dir}")
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()  # Windows 打包为 exe 时需要
     main()
+
