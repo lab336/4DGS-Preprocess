@@ -21,7 +21,7 @@
       ...
 
 使用方法:
-  python Convert/batch_undistort_frames.py --xml cameras.xml --images_group images_group --output_dir output
+python Convert/batch_undistort_frames.py --xml cameras.xml --images_group images_group --output_dir output
 
 作者: GitHub Copilot
 """

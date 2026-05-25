@@ -24,6 +24,7 @@
   --output_mode : 输出组织方式：by_video / by_frame / both（默认 by_frame）
   --workers     : 并行进程数，默认 CPU 核数 / 2
   --use_seek    : 启用 seek 快速跳帧（稀疏采样时极大提速，默认关闭）
+  --start_idx   : 视频/摄像头编号的起始值（默认 1，用于多批次续接编号）
 
 优先级：先按 target_fps 降采样，再按 num_frames 限制总帧数。
 """
@@ -124,6 +125,7 @@ def process_video(task: dict) -> int:
     total_videos = task["total_videos"]
     output_mode  = task["output_mode"]
     use_seek     = task["use_seek"]
+    start_idx    = task.get("start_idx", 1)
 
     try:
         cap = open_video(video_path)
@@ -155,7 +157,7 @@ def process_video(task: dict) -> int:
                 if not ret:
                     continue
                 if need_bv:
-                    _write_safe(os.path.join(bv_subdir, f"{frame_seq}.jpg"), frame)
+                    _write_safe(os.path.join(bv_subdir, f"{frame_seq + start_idx - 1}.jpg"), frame)
                 if need_bf:
                     _write_safe(os.path.join(by_frame_dir, str(frame_seq),
                                              f"{video_idx}.jpg"), frame)
@@ -185,7 +187,7 @@ def process_video(task: dict) -> int:
                         break
                     frame_count += 1
                     if need_bv:
-                        _write_safe(os.path.join(bv_subdir, f"{frame_count}.jpg"), frame)
+                        _write_safe(os.path.join(bv_subdir, f"{frame_count + start_idx - 1}.jpg"), frame)
                     if need_bf:
                         _write_safe(os.path.join(by_frame_dir, str(frame_count),
                                                  f"{video_idx}.jpg"), frame)
@@ -220,22 +222,24 @@ def main():
     default_workers = max(1, cpu_count // 2)
 
     parser = argparse.ArgumentParser(description="批量提取视频帧（多进程加速版）")
-    parser.add_argument("--data_dir",    type=str, default="video",
+    parser.add_argument("--data_dir",    type=str, default="DJI/video/3.mp4",
                         help="视频所在目录")
-    parser.add_argument("--output_dir",  type=str, default="output",
+    parser.add_argument("--start_idx",   type=int, default=1,
+                        help="视频/摄像头编号的起始值（默认 1，可设为其他值以续接之前的批次）")
+    parser.add_argument("--output_dir",  type=str, default="DJI/images",
                         help="输出根目录")
     parser.add_argument("--num_frames",  type=int, default=0,
                         help="每视频提取帧数（0=全部）")
-    parser.add_argument("--target_fps",  type=float, default=30,
+    parser.add_argument("--target_fps",  type=float, default=3,
                         help="目标帧率（如原始120fps设30则每秒取30帧，0=不限）")
     parser.add_argument("--sample_mode", type=str, default="uniform",
                         choices=["uniform", "head"],
                         help="采样方式：uniform=均匀采样，head=严格前N帧")
     parser.add_argument("--ext",         type=str, default=".mp4",
                         help="视频文件扩展名")
-    parser.add_argument("--output_mode", type=str, default="by_frame",
+    parser.add_argument("--output_mode", type=str, default="by_video",
                         choices=["by_video", "by_frame", "both"],
-                        help="输出组织方式：by_video / by_frame / both（默认 by_frame）")
+                        help="输出组织方式：by_video / by_frame / both（默认 by_video）")
     parser.add_argument("--workers",     type=int, default=default_workers,
                         help=f"并行处理视频的进程数（默认 {default_workers}）")
     parser.add_argument("--use_seek",    action="store_true",
@@ -245,10 +249,16 @@ def main():
     data_dir   = os.path.abspath(args.data_dir)
     output_dir = os.path.abspath(args.output_dir)
 
-    video_files = sorted(
-        f for f in os.listdir(data_dir)
-        if os.path.splitext(f)[1].lower() == args.ext.lower()
-    )
+    # 支持单个视频文件作为输入
+    if os.path.isfile(data_dir):
+        video_path = data_dir
+        data_dir   = os.path.dirname(video_path)
+        video_files = [os.path.basename(video_path)]
+    else:
+        video_files = sorted(
+            f for f in os.listdir(data_dir)
+            if os.path.splitext(f)[1].lower() == args.ext.lower()
+        )
     if not video_files:
         print(f"在 {data_dir} 中未找到 {args.ext} 视频文件")
         return
@@ -294,6 +304,7 @@ def main():
             "total_videos": len(video_files),
             "output_mode":  args.output_mode,
             "use_seek":     args.use_seek,
+            "start_idx":    args.start_idx,
         }
         for idx, filename in enumerate(video_files, start=1)
     ]

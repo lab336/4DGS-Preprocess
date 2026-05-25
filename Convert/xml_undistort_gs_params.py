@@ -10,7 +10,7 @@
 5. 导出适用于3DGS训练的图像和更新后的相机参数
 
 使用方法:
-python Convert/xml_undistort_gs_params.py --xml images/all_params/cameras_all_params.xml --images_dir images/2.0/No_Glasses --output_dir images/all_params/ --no_unified_intrinsics
+python Convert/xml_undistort_gs_params.py --xml  --images_dir  --output_dir  --no_unified_intrinsics
 
 作者: GitHub Copilot
 """

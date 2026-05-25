@@ -8,3 +8,6 @@ output/*
 images/*
 data/*
 video/*
+frames1/*
+DJI/*
+colmap/*

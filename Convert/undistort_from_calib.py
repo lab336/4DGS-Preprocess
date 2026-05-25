@@ -9,10 +9,7 @@
 - 输出COLMAP格式（PINHOLE模型，无畸变）
 
 使用方法:
-  python undistort_from_calib.py \
-    --calib calib.json \
-    --images_dir images \
-    --output_dir undistorted
+python undistort_from_calib.py --calib calib.json --images_dir images --output_dir undistorted
 """
 
 import argparse
@@ -70,19 +67,28 @@ def extract_intrinsics(cam_entry: Dict[str, Any]) -> Tuple[Tuple[float, float], 
 
 def extract_extrinsics(cam_entry: Dict[str, Any]) -> Optional[np.ndarray]:
     """从相机条目提取外参（4x4变换矩阵，world-to-camera）"""
-    model = cam_entry.get('model', {})
-    data = model.get('ptr_wrapper', {}).get('data', {})
-    pose = data.get('pose', {})
-    
-    # 尝试获取旋转和平移
-    rotation = pose.get('rotation', {})
-    translation = pose.get('translation', {})
+    # 优先从 cam_entry['transform'] 读取（libCalib 格式）
+    transform = cam_entry.get('transform', {})
+    if transform:
+        rotation = transform.get('rotation', {})
+        translation = transform.get('translation', {})
+    else:
+        # 回退到 model.ptr_wrapper.data.pose
+        model = cam_entry.get('model', {})
+        data = model.get('ptr_wrapper', {}).get('data', {})
+        pose = data.get('pose', {})
+        rotation = pose.get('rotation', {})
+        translation = pose.get('translation', {})
     
     if not rotation or not translation:
         return None
     
-    # 旋转可能是四元数或旋转矩阵
-    if 'w' in rotation:
+    # 旋转格式判断
+    if 'rx' in rotation:
+        # Rodrigues 向量格式 (rx, ry, rz)
+        rvec = np.array([rotation['rx'], rotation['ry'], rotation['rz']], dtype=np.float64)
+        R, _ = cv2.Rodrigues(rvec)
+    elif 'w' in rotation:
         # 四元数格式 (w, x, y, z)
         qw = rotation.get('w', 1.0)
         qx = rotation.get('x', 0.0)

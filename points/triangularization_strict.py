@@ -6,10 +6,15 @@
     python main.py
     python main.py --frames 1,2,3 --roma_setting fast
     python main.py --num_samples 8000 --neighbor_range 5
+可单帧也可多帧：
+python .\points\triangularization_strict.py --num_samples 8000 --neighbor_range 5 --data_dir .\data2\dense\ --output_dir .\data2\dense\points
+
 """
 
 import argparse
+import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -36,12 +41,11 @@ class Config:
     min_confidence: float = 0.1              # RoMa overlap 置信度过滤阈值
     ransac_threshold: float = 1.0            # RANSAC 阈值 (像素，严格提高可靠性)
     reproj_threshold: float = 2.0            # 逐对重投影误差阈值 (像素，严格)
-    epipolar_threshold: float = 2.0          # 极线距离阈值 (像素，用已知位姿计算)
     max_depth: float = 100.0                 # 三角化最大深度
     min_depth: float = 0.05                  # 三角化最小深度
-    min_angle: float = 1.0                   # 最小三角化角度 (度)，降低以保留花瓣
-    min_observations: int = 1                # 点至少被多少个视图对独立三角化 (1=单对也接受)
-    min_visible_views: int = 2               # 多视角可见性：至少被 2 个相机看到
+    min_angle: float = 1.5                   # 最小三角化角度 (度)，过滤退化三角化
+    min_observations: int = 2                # 点至少被多少个视图对独立三角化
+    min_visible_views: int = 3               # 多视角可见性：至少被 N 个相机看到
     neighbor_range: int = 3                  # 每个相机与前后 N 个邻居配对
     sor_k: int = 10                          # 统计离群值去除 - 近邻数
     sor_std: float = 3.0                     # 统计离群值去除 - 标准差倍数
@@ -115,42 +119,6 @@ def scale_intrinsics(K: np.ndarray, colmap_w: int, colmap_h: int,
 
 
 # ======================== 三角化与过滤 ========================
-
-def compute_fundamental_from_poses(K1, R1, t1, K2, R2, t2):
-    """从已知相机位姿直接计算 Fundamental Matrix。
-
-    这比 RANSAC 估计 E 矩阵更可靠，因为：
-    - 不会被背景主导，花瓣等小物体不会被当作 outlier
-    - 所有深度的点都满足同一个极线约束
-    """
-    R_rel = R2 @ R1.T
-    t_rel = t2 - R_rel @ t1
-    tx = np.array([[0, -t_rel[2], t_rel[1]],
-                   [t_rel[2], 0, -t_rel[0]],
-                   [-t_rel[1], t_rel[0], 0]], dtype=np.float64)
-    E = tx @ R_rel
-    F = np.linalg.inv(K2).T @ E @ np.linalg.inv(K1)
-    return F
-
-
-def epipolar_filter(pts1, pts2, F, threshold):
-    """用已知 F 矩阵做极线距离过滤。
-
-    Sampson 距离：综合考虑两个方向的极线距离，比单侧更鲁棒。
-    优势：不会像 RANSAC 那样被背景主导，花瓣等小物体不会被误删。
-    """
-    n = len(pts1)
-    p1h = np.hstack([pts1, np.ones((n, 1))])  # Nx3
-    p2h = np.hstack([pts2, np.ones((n, 1))])
-    Fp1 = (F @ p1h.T).T       # Nx3: 极线 in image2
-    Ftp2 = (F.T @ p2h.T).T    # Nx3: 极线 in image1
-    # p2^T F p1
-    pfp = np.sum(p2h * Fp1, axis=1)
-    # Sampson distance
-    denom = Fp1[:, 0]**2 + Fp1[:, 1]**2 + Ftp2[:, 0]**2 + Ftp2[:, 1]**2
-    sampson = pfp**2 / (denom + 1e-12)
-    return sampson < threshold**2
-
 
 def triangulate_points(K1, R1, t1, K2, R2, t2, pts1, pts2):
     """从两个视角三角化三维点。"""
@@ -252,7 +220,7 @@ def multiview_visibility_filter(pts3d, valid_images, K_cache, images_info,
 
 
 def multiview_color_blend(pts3d, valid_images, K_cache, images_info,
-                          img_dir, actual_w, actual_h):
+                          img_dir, actual_w, actual_h, img_cache=None):
     """从所有可见视角混合提取颜色（比单视角更稳健）。"""
     n = len(pts3d)
     if n == 0:
@@ -270,14 +238,20 @@ def multiview_color_blend(pts3d, valid_images, K_cache, images_info,
         safe_d = np.where(depth > 0, depth, 1.0)
         u = np.round(proj[0] / safe_d).astype(int)
         v = np.round(proj[1] / safe_d).astype(int)
-        valid = ((depth > 0) & (u >= 0) & (u < actual_w)
-                 & (v >= 0) & (v < actual_h))
+        if img_cache is not None and name in img_cache:
+            img_rgb = img_cache[name]
+            h_img, w_img = img_rgb.shape[:2]
+        else:
+            img = cv2.imread(str(img_dir / name))
+            if img is None:
+                continue
+            h_img, w_img = img.shape[:2]
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        # 按当前图像真实尺寸判断可见性，避免不同分辨率图像导致越界索引。
+        valid = ((depth > 0) & (u >= 0) & (u < w_img)
+                 & (v >= 0) & (v < h_img))
         if not np.any(valid):
             continue
-        img = cv2.imread(str(img_dir / name))
-        if img is None:
-            continue
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         idx = np.where(valid)[0]
         color_sum[idx] += img_rgb[v[idx], u[idx]].astype(np.float64)
         color_cnt[idx] += 1
@@ -287,37 +261,16 @@ def multiview_color_blend(pts3d, valid_images, K_cache, images_info,
 
 # ======================== 点云去噪 ========================
 
-def statistical_outlier_removal(points, colors, k=10, std_mul=3.0):
-    """统计离群值去除，保护稀疏簇（花瓣）。
-
-    策略：先识别稀疏点（近邻距离 > 75th percentile 的 3 倍），
-    在密集区域做 SOR，稀疏点全部保留。
-    这样浮在空中的花瓣不会被删除。
-    """
+def statistical_outlier_removal(points, colors, k=20, std_mul=2.0):
+    """统计离群值去除：剔除到 k 近邻平均距离异常大的点。"""
     if len(points) < k + 1:
         return points, colors
     tree = cKDTree(points)
     dists, _ = tree.query(points, k=k + 1)
     mean_d = dists[:, 1:].mean(axis=1)
-
-    # 识别稀疏点：近邻距离远超过典型值的点是漂浮物（花瓣）
-    p75 = np.percentile(mean_d, 75)
-    is_sparse = mean_d > p75 * 3.0  # 孤立的稀疏点
-
-    # 只对密集区域做 SOR
-    dense_mask = ~is_sparse
-    if dense_mask.sum() > k + 1:
-        dense_mean = mean_d[dense_mask]
-        thr = dense_mean.mean() + std_mul * dense_mean.std()
-        # 密集区域内超过阈值的点删除
-        dense_outlier = dense_mask & (mean_d > thr)
-        keep = ~dense_outlier
-    else:
-        keep = np.ones(len(points), dtype=bool)
-
-    # 稀疏点全部保留
-    keep[is_sparse] = True
-    return points[keep], colors[keep]
+    thr = mean_d.mean() + std_mul * mean_d.std()
+    mask = mean_d < thr
+    return points[mask], colors[mask]
 
 
 # ======================== 密度感知降采样 ========================
@@ -360,13 +313,18 @@ def density_aware_downsample(points, colors, target_n, density_k=16):
 
 # ======================== 颜色提取（单视角，用于中间阶段） ========================
 
-def extract_colors(img_path, K, R, t, pts3d):
+def extract_colors(img_path, K, R, t, pts3d, img_cache=None):
     """将三维点投影到图像上获取 RGB 颜色。"""
-    img = cv2.imread(str(img_path))
-    if img is None:
-        return np.zeros((len(pts3d), 3), dtype=np.uint8)
-    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    H, W = img.shape[:2]
+    name = Path(img_path).name
+    if img_cache is not None and name in img_cache:
+        img_rgb = img_cache[name]
+        H, W = img_rgb.shape[:2]
+    else:
+        img = cv2.imread(str(img_path))
+        if img is None:
+            return np.zeros((len(pts3d), 3), dtype=np.uint8)
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        H, W = img.shape[:2]
     P = K @ np.hstack([R, t.reshape(3, 1)])
     h = np.hstack([pts3d, np.ones((len(pts3d), 1))]).T
     proj = P @ h
@@ -414,6 +372,26 @@ def build_pairs(n_images, neighbor_range):
     return pairs
 
 
+# ======================== 并行工具 ========================
+
+def get_n_workers() -> int:
+    """返回 80% 的 CPU 核数（至少 1）。"""
+    return max(1, int(os.cpu_count() * 0.8))
+
+
+def preload_images(img_dir: Path, image_names: list, n_workers: int) -> dict:
+    """并行将图像预加载为 RGB numpy 数组，返回 {name: img_rgb}。"""
+    def _load(name):
+        img = cv2.imread(str(img_dir / name))
+        if img is None:
+            return name, None
+        return name, cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        results = list(pool.map(_load, image_names))
+    return {name: img for name, img in results if img is not None}
+
+
 # ======================== 单帧处理 ========================
 
 def process_frame(frame_id, frame_dir, cameras, images_info, model, cfg):
@@ -436,8 +414,14 @@ def process_frame(frame_id, frame_dir, cameras, images_info, model, cfg):
         print(f"  [帧 {frame_id}] 有效图像不足 (< 2)，跳过")
         return np.zeros((0, 3)), np.zeros((0, 3), dtype=np.uint8)
 
-    sample_img = PILImage.open(str(img_dir / valid_images[0]))
-    actual_w, actual_h = sample_img.size
+    n_workers = get_n_workers()
+    tqdm.write(f"  [帧 {frame_id}] 预加载 {len(valid_images)} 张图像 (workers={n_workers})...")
+    img_cache = preload_images(img_dir, valid_images, n_workers)
+    if not img_cache:
+        print(f"  [帧 {frame_id}] 图像加载失败，跳过")
+        return np.zeros((0, 3)), np.zeros((0, 3), dtype=np.uint8)
+    first_img = img_cache[valid_images[0]]
+    actual_h, actual_w = first_img.shape[:2]
 
     K_cache = {}
     for name in valid_images:
@@ -448,73 +432,92 @@ def process_frame(frame_id, frame_dir, cameras, images_info, model, cfg):
 
     pairs = build_pairs(len(valid_images), cfg.neighbor_range)
 
-    # ==================== Phase 1: 逐对严格三角化 ====================
-    raw_pts, raw_clr = [], []
-    total_raw = 0
-    pair_bar = tqdm(pairs, desc=f"  帧 {frame_id} Phase1", leave=False)
-
-    for idx_i, idx_j in pair_bar:
+    # ==================== Phase 1-GPU: 逐对 RoMa 特征匹配（顺序） ====================
+    match_data = []
+    gpu_bar = tqdm(pairs, desc=f"  帧 {frame_id} Phase1-GPU", leave=False)
+    for idx_i, idx_j in gpu_bar:
         ni, nj = valid_images[idx_i], valid_images[idx_j]
         path_i, path_j = str(img_dir / ni), str(img_dir / nj)
-        Ki, Kj = K_cache[ni], K_cache[nj]
-        Ri, ti = images_info[ni]["R"], images_info[ni]["t"]
-        Rj, tj = images_info[nj]["R"], images_info[nj]["t"]
-
         try:
             preds = model.match(path_i, path_j)
         except Exception as e:
             tqdm.write(f"    匹配失败 ({ni}<->{nj}): {e}")
             continue
-
         matches, overlaps, _, _ = model.sample(preds, cfg.num_samples)
         kpA, kpB = model.to_pixel_coordinates(matches, actual_h, actual_w,
                                                actual_h, actual_w)
         pts_i = kpA.cpu().numpy()
         pts_j = kpB.cpu().numpy()
         conf = overlaps.cpu().numpy()
-
         cmask = conf > cfg.min_confidence
         pts_i, pts_j = pts_i[cmask], pts_j[cmask]
-        n_match = len(pts_i)
-        if n_match < 8:
-            continue
+        if len(pts_i) >= 8:
+            match_data.append((ni, nj, pts_i, pts_j))
 
-        # 用已知位姿计算 Fundamental Matrix，用极线距离过滤
-        # 不用 RANSAC —— 避免背景主导导致花瓣匹配被报废
-        F = compute_fundamental_from_poses(Ki, Ri, ti, Kj, Rj, tj)
-        epi_mask = epipolar_filter(pts_i, pts_j, F, cfg.epipolar_threshold)
-        in_i, in_j = pts_i[epi_mask], pts_j[epi_mask]
-        n_inlier = len(in_i)
+    # ==================== Phase 1-CPU: 并行三角化与过滤 ====================
+    def _triangulate_pair(args):
+        ni, nj, pts_i, pts_j = args
+        Ki, Kj = K_cache[ni], K_cache[nj]
+        Ri, ti = images_info[ni]["R"], images_info[ni]["t"]
+        Rj, tj = images_info[nj]["R"], images_info[nj]["t"]
+        n_match = len(pts_i)
+
+        E, emask = cv2.findEssentialMat(
+            pts_i, pts_j, Ki,
+            method=cv2.USAC_MAGSAC, prob=0.999999,
+            threshold=cfg.ransac_threshold, maxIters=10000,
+        )
+        if emask is None:
+            return None
+        emask = emask.ravel().astype(bool)
+        n_inlier = int(emask.sum())
         if n_inlier < 10:
-            continue
+            return None
+        in_i, in_j = pts_i[emask], pts_j[emask]
 
         pts3d = triangulate_points(Ki, Ri, ti, Kj, Rj, tj, in_i, in_j)
 
         # 三角化角度过滤：角度太小时深度极不稳定
         angles = compute_triangulation_angles(Ri, ti, Rj, tj, pts3d)
         amask = angles >= cfg.min_angle
+        n_angle = int(amask.sum())
         pts3d, in_i, in_j = pts3d[amask], in_i[amask], in_j[amask]
 
         # 深度过滤
         dmask = filter_by_depth(Ri, ti, Rj, tj, pts3d, cfg.min_depth, cfg.max_depth)
         pts3d, in_i, in_j = pts3d[dmask], in_i[dmask], in_j[dmask]
         if len(pts3d) == 0:
-            continue
+            return None
 
         # 严格重投影误差过滤
         rmask = filter_by_reprojection(Ki, Ri, ti, Kj, Rj, tj,
                                        in_i, in_j, pts3d, cfg.reproj_threshold)
         pts3d, in_i = pts3d[rmask], in_i[rmask]
         if len(pts3d) == 0:
-            continue
+            return None
 
-        clr = extract_colors(path_i, Ki, Ri, ti, pts3d)
+        clr = extract_colors(str(img_dir / ni), Ki, Ri, ti, pts3d, img_cache)
+        return pts3d, clr, n_match, n_inlier, n_angle
+
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        pair_results = list(tqdm(
+            pool.map(_triangulate_pair, match_data),
+            total=len(match_data),
+            desc=f"  帧 {frame_id} Phase1-CPU",
+            leave=False,
+        ))
+
+    raw_pts, raw_clr = [], []
+    total_raw = 0
+    for (ni, nj, *_), result in zip(match_data, pair_results):
+        if result is None:
+            continue
+        pts3d, clr, n_match, n_inlier, n_angle = result
         raw_pts.append(pts3d)
         raw_clr.append(clr)
         total_raw += len(pts3d)
-
         tqdm.write(f"    [{ni}<->{nj}] 匹配:{n_match} 内点:{n_inlier} "
-                   f"角度ok:{int(amask.sum())} 三角化:{len(pts3d)}")
+                   f"角度ok:{n_angle} 三角化:{len(pts3d)}")
 
     if not raw_pts:
         return np.zeros((0, 3)), np.zeros((0, 3), dtype=np.uint8)
@@ -548,7 +551,7 @@ def process_frame(frame_id, frame_dir, cameras, images_info, model, cfg):
     tqdm.write(f"  [帧 {frame_id}] Phase4: 多视角颜色混合...")
     colors = multiview_color_blend(
         merged_pts, valid_images, K_cache, images_info,
-        img_dir, actual_w, actual_h)
+        img_dir, actual_w, actual_h, img_cache)
 
     return merged_pts, colors
 
@@ -570,24 +573,22 @@ def main():
                         help="每帧最终目标点数")
     parser.add_argument("--neighbor_range", type=int, default=3,
                         help="相邻相机配对范围")
-    parser.add_argument("--roma_setting", default="fast",
+    parser.add_argument("--roma_setting", default="turbo",
                         choices=["turbo", "fast", "base", "precise"],
                         help="RoMa v2 速度/精度模式")
     parser.add_argument("--min_confidence", type=float, default=0.1,
                         help="最小 overlap 置信度")
     parser.add_argument("--ransac_threshold", type=float, default=1.0,
-                        help="RANSAC 阈值 (像素，备用)")
+                        help="RANSAC 阈值 (像素)")
     parser.add_argument("--reproj_threshold", type=float, default=2.0,
                         help="逐对重投影误差阈值 (像素)")
-    parser.add_argument("--epipolar_threshold", type=float, default=2.0,
-                        help="极线距离阈值 (像素)")
     parser.add_argument("--max_depth", type=float, default=100.0,
                         help="最大深度")
-    parser.add_argument("--min_angle", type=float, default=1.0,
+    parser.add_argument("--min_angle", type=float, default=1.5,
                         help="最小三角化角度 (度)")
-    parser.add_argument("--min_observations", type=int, default=1,
+    parser.add_argument("--min_observations", type=int, default=2,
                         help="点至少被多少对相机独立三角化")
-    parser.add_argument("--min_visible_views", type=int, default=2,
+    parser.add_argument("--min_visible_views", type=int, default=3,
                         help="点至少被多少个相机看到")
     parser.add_argument("--sor_k", type=int, default=10,
                         help="SOR 近邻数")
@@ -605,7 +606,6 @@ def main():
         min_confidence=args.min_confidence,
         ransac_threshold=args.ransac_threshold,
         reproj_threshold=args.reproj_threshold,
-        epipolar_threshold=args.epipolar_threshold,
         max_depth=args.max_depth,
         min_angle=args.min_angle,
         min_observations=args.min_observations,
@@ -636,14 +636,20 @@ def main():
     print(f"      模型就绪，设备: {dev}")
 
     # ---- 3. 确定帧列表 ----
+    # 兼容两种数据组织：
+    # 1) 多帧: data_dir/{1,2,3,...}/images
+    # 2) 单帧: data_dir/images
     if args.frames:
         frame_ids = [s.strip() for s in args.frames.split(",")]
     else:
-        frame_ids = sorted(
-            [d.name for d in data_path.iterdir()
-             if d.is_dir() and d.name != "sparse"],
-            key=lambda x: int(x),
-        )
+        if (data_path / "images").exists():
+            frame_ids = ["."]
+        else:
+            frame_ids = sorted(
+                [d.name for d in data_path.iterdir()
+                 if d.is_dir() and d.name.isdigit()],
+                key=lambda x: int(x),
+            )
     print(f"[3/4] 待处理帧: {len(frame_ids)} 帧")
     print(f"      参数: samples={cfg.num_samples}, target={cfg.target_points}, "
           f"neighbors={cfg.neighbor_range}, "
@@ -651,16 +657,17 @@ def main():
 
     # ---- 4. 逐帧处理 ----
     print("[4/4] 开始重建 ...")
-    for fid in tqdm(frame_ids, desc="总进度"):
-        fdir = data_path / fid
+    for out_idx, fid in enumerate(tqdm(frame_ids, desc="总进度"), start=1):
+        fdir = data_path if fid == "." else (data_path / fid)
+        frame_tag = "root" if fid == "." else fid
         if not (fdir / "images").exists():
-            tqdm.write(f"  [帧 {fid}] 目录不存在，跳过")
+            tqdm.write(f"  [帧 {frame_tag}] 目录不存在，跳过")
             continue
 
-        points, colors = process_frame(fid, fdir, cameras, images_info, model, cfg)
+        points, colors = process_frame(frame_tag, fdir, cameras, images_info, model, cfg)
 
         if len(points) == 0:
-            tqdm.write(f"  [帧 {fid}] 无有效三维点")
+            tqdm.write(f"  [帧 {frame_tag}] 无有效三维点")
             continue
 
         before = len(points)
@@ -673,9 +680,9 @@ def main():
         # 密度感知降采样：密集区域多删，稀疏区域（花瓣）保留
         points, colors = density_aware_downsample(points, colors, cfg.target_points)
 
-        ply_path = out_path / f"pcd{fid}.ply"
+        ply_path = out_path / f"{out_idx}.ply"
         save_ply(ply_path, points, colors)
-        tqdm.write(f"  [帧 {fid}] 点数: {before} -> {after_sor}(去噪) -> {len(points)}(降采样)  "
+        tqdm.write(f"  [帧 {frame_tag}] 点数: {before} -> {after_sor}(去噪) -> {len(points)}(降采样)  "
                    f"=> {ply_path}")
 
     print("\n全部完成！输出目录:", out_path.resolve())
