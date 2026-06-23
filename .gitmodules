@@ -1,3 +1,6 @@
 [submodule "colmap/SuperGluePretrainedNetwork"]
 	path = colmap/SuperGluePretrainedNetwork
 	url = https://github.com/magicleap/SuperGluePretrainedNetwork
+[submodule "colmap/WAFT"]
+	path = colmap/WAFT
+	url = https://github.com/princeton-vl/WAFT
