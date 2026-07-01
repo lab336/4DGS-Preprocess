@@ -5,7 +5,10 @@
 作用：用 `colmap/SuperGluePretrainedNetwork` 替代 COLMAP 自带 matcher，估计每帧相机的内参、外参、稀疏点云，并把光流估计出的速度写入 PLY。
 
 > 大多数参数已经设了适合本数据集（约 100 路相机、4K 图像）的默认值，**正常情况下只需要几个参数**，见第 3 节。需要调的参数在第 5 节有详细解释。
-
+在 4 卡机上
+conda run --no-capture-output -n gsstatic python colmap/superglue_colmap.py --frames 1:201 --static_rig --force `
+  --images_root .\data\two\images\ --output_root .\output\twopeople --resize -1 `
+  --gpus 0,1,2,3
 
 单帧运行：
 conda run --no-capture-output -n gsstatic python colmap/superglue_colmap.py `
@@ -225,6 +228,24 @@ conda run --no-capture-output -n gsstatic python colmap/superglue_colmap.py --fr
 | `--decode_workers 4` | 4 | 后台预解码图片的线程数，让磁盘/CPU 的 4K 解码和 GPU 检测重叠。输出不变。机器核多可调大；设 `1` 关闭预取。 |
 | `--fp16` | 开 | SuperPoint+SuperGlue 用 fp16 混合精度（Ampere/Ada 上约 1.5~2×）。**关键点坐标仍保持 fp32**，匹配点集只有极微差异（后面有 RANSAC + 对极清洗兜底）。要逐位一致的全精度匹配用 `--no-fp16`。 |
 | `--tf32` | 开 | 允许 Ampere+ 上的 TF32 矩阵/卷积（小幅加速，数值差异比 fp16 更小）。要绝对精确用 `--no-tf32`。 |
+| `--gpus` | 关（单卡） | **多卡数据并行**。传 `0,1,2,3`（或 `all`）后，把「逐帧 SuperGlue 匹配」和「WAFT 逐相机光流」两个 GPU 大头分摊到多张卡上——每张卡一个 worker 进程，帧/光流图相互独立，输出与单卡一致。不传 = 保持单卡（`--device`）行为。参考帧仍单卡解一次。仅 `--device cuda` 生效。 |
+| `--colmap_threads` | 0=自动 | 每个 COLMAP mapper/point_triangulator 调用的线程数（`--Mapper.num_threads`）。`0`=自动：单卡不限（沿用旧行为），多卡时取 `CPU核数//卡数`，避免 4 个并发 COLMAP 抢满 CPU。 |
+
+### 多GPU（把整个项目搬到多卡机器上跑）
+
+在有多张卡的机器上，直接加 `--gpus 0,1,2,3` 即可让匹配和光流两个阶段接近 **N×** 加速（N=卡数）：
+
+```powershell
+conda run --no-capture-output -n gsstatic python colmap/superglue_colmap.py --frames 1:201 --static_rig --force `
+  --images_root .\data\two\images\ --output_root .\output\twopeople --resize -1 `
+  --gpus 0,1,2,3
+```
+
+- 原理：每张卡起一个独立 worker 进程（`CUDA_VISIBLE_DEVICES` 绑卡），从共享队列里领帧/领光流图，谁空谁领——天然负载均衡。各 worker 只写互不相交的文件（`points/<帧>.ply`、`undistorted/images/<帧>/`、`velocities/<帧>.npz`、`flows/<源帧>/<相机>.npy`），**输出与单卡完全一致**（fp16 的非逐位一致是既有行为，与多卡无关）。
+- 参考帧位姿解算跑一次、仍用单卡（`--gpus` 里的第一张卡）；之后的逐帧匹配+三角化、以及 WAFT 光流才多卡并行。速度阶段（CPU）在主进程单次完成。
+- 单帧/单光流图若失败，只记 warning 继续，不再整批中断。
+- CPU 别抢崩：多卡会并发多个 COLMAP solve，脚本默认按 `CPU核数//卡数` 限制每个 solve 的线程；需要手动可用 `--colmap_threads`。
+- **Dense/MVS（`--dense`）另说**：COLMAP `patch_match_stereo` 自己就支持多卡，直接 `--gpu_index 0,1,2,3` 即可（与上面的 `--gpus` 相互独立）。
 
 > 说明：`--fp16` / `--tf32` 是「近似无损」——实测对 SfM 质量基本无影响，但不是逐位相同。若你要求严格可复现，用 `--no-fp16 --no-tf32`，仍可享受 `--pipeline` + 预解码（这两者**逐位一致**）带来的提速。COLMAP 三角化/去畸变本身已默认吃满所有 CPU 核。
 

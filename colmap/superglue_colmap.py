@@ -16,7 +16,9 @@ import itertools
 from collections import deque
 import json
 import logging
+import multiprocessing as mp
 import os
+import queue as queue_mod
 import shutil
 import sqlite3
 import subprocess
@@ -192,6 +194,36 @@ def auto_workers(kind: str) -> int:
         return 2 if cores >= 8 else 1
     # crop export (cv2, GIL-released): more threads overlap disk, capped to avoid contention.
     return max(1, min(cores, 8))
+
+
+def parse_gpus(spec: str | None) -> list[int]:
+    """Parse ``--gpus`` into a list of physical device indices.
+
+    '' / None -> [] (single-GPU / current behavior). 'all' -> every visible CUDA
+    device. '0,1,2,3' -> [0, 1, 2, 3]. Duplicates are dropped, order preserved.
+    """
+    if not spec:
+        return []
+    spec = spec.strip()
+    if spec.lower() == "all":
+        try:
+            import torch
+
+            n = int(torch.cuda.device_count())
+        except Exception:
+            n = 0
+        return list(range(n))
+    out: list[int] = []
+    seen: set[int] = set()
+    for tok in spec.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        idx = int(tok)
+        if idx not in seen:
+            seen.add(idx)
+            out.append(idx)
+    return out
 
 
 def resolve_colmap(colmap_arg: str) -> str:
@@ -935,7 +967,11 @@ def run_mapper(colmap: str, database_path: Path, image_dir: Path, sparse_dir: Pa
             str(args.mapper_tri_min_angle),
             "--Mapper.multiple_models",
             "1" if multiple_models else "0",
-        ]
+        ] + (
+            ["--Mapper.num_threads", str(args.mapper_num_threads)]
+            if getattr(args, "mapper_num_threads", 0)
+            else []
+        )
 
     cmd = build_mapper_cmd(args.mapper_multiple_models)
     try:
@@ -2441,6 +2477,8 @@ def run_point_triangulator(
         "--Mapper.min_num_matches",
         str(args.mapper_min_num_matches),
     ]
+    if getattr(args, "mapper_num_threads", 0):
+        base_cmd += ["--Mapper.num_threads", str(args.mapper_num_threads)]
     # Keep every camera pose exactly equal to the shared reference solve.
     cmd = base_cmd + (["--Mapper.fix_existing_images", "1"] if args.rig_fix_poses else [])
     try:
@@ -2556,6 +2594,231 @@ def triangulate_frame_with_rig(
     return rig_solve_stage(match, args, colmap, ref_cameras, ref_pose_by_name, export_ctx)
 
 
+# ----------------------------------------------------------------------------
+# Multi-GPU data-parallel workers (one process per GPU, shared work queue).
+#
+# Every unit of work (a frame for matching+solve, or one (source,camera) flow
+# map) is independent and writes a disjoint output file, so sharding across GPUs
+# leaves the output unchanged. Each worker pins itself to one card via
+# CUDA_VISIBLE_DEVICES *before* torch initialises CUDA (SuperGlueMatcher/
+# WaftFlowRunner import torch lazily, so setting it at the top of the worker is
+# safe). Workers are module-level functions so they pickle under 'spawn'.
+# ----------------------------------------------------------------------------
+
+
+def _frame_worker(gpu_id, args, colmap, ref_bundle, work_q, result_q) -> None:
+    """Process frames off ``work_q`` on one GPU.
+
+    ref_bundle is None for non-static-rig (each frame is a full independent
+    reconstruct_frame); otherwise it carries the shared reference state so the
+    frame is triangulated against the fixed rig poses.
+    """
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    setup_logging(args.verbose, progress=False)
+    try:
+        matcher = make_matcher(args)
+    except Exception as exc:  # GPU/model init failed on this worker
+        result_q.put(("fatal", str(gpu_id), repr(exc)))
+        return
+
+    export_ctx = None
+    ref_cameras = ref_pose_by_name = ref_images_by_name = fixed_pairs = None
+    if ref_bundle is not None:
+        ref_cameras, ref_pose_by_name, ref_images_by_name, fixed_pairs, ex_info = ref_bundle
+        if ex_info is not None:
+            images_root, sparse_dir, crop_by_name = ex_info
+            export_ctx = ExportContext(images_root=images_root, sparse_dir=sparse_dir, crop_by_name=crop_by_name)
+
+    while True:
+        frame_dir = work_q.get()
+        if frame_dir is None:
+            break
+        name = frame_dir.name
+        try:
+            if ref_bundle is not None:
+                stats, *_ = triangulate_frame_with_rig(
+                    frame_dir, name, args, colmap, matcher,
+                    ref_cameras, ref_pose_by_name, ref_images_by_name, fixed_pairs, export_ctx,
+                )
+            else:
+                stats, *_ = reconstruct_frame(frame_dir, name, args, colmap, matcher)
+            result_q.put(("ok", name, stats))
+        except Exception as exc:
+            result_q.put(("err", name, repr(exc)))
+
+
+def run_frames_multigpu(frames, gpus, args, colmap, ref_bundle, frame_bar) -> list[dict]:
+    """Fan a list of frame dirs out over one worker process per GPU."""
+    ctx = mp.get_context("spawn")
+    work_q = ctx.Queue()
+    result_q = ctx.Queue()
+    for frame_dir in frames:
+        work_q.put(frame_dir)
+    for _ in gpus:
+        work_q.put(None)  # one stop sentinel per worker
+
+    procs = [
+        ctx.Process(target=_frame_worker, args=(gid, args, colmap, ref_bundle, work_q, result_q), daemon=False)
+        for gid in gpus
+    ]
+    for p in procs:
+        p.start()
+
+    stats_list: list[dict] = []
+    expected = {frame_dir.name for frame_dir in frames}
+    while expected:
+        try:
+            kind, name, payload = result_q.get(timeout=5.0)
+        except queue_mod.Empty:
+            if not any(p.is_alive() for p in procs):
+                break  # workers gone; avoid deadlocking on unprocessed frames
+            continue
+        if kind == "ok":
+            stats_list.append(payload)
+            expected.discard(name)
+            frame_bar.update(1)
+        elif kind == "err":
+            LOGGER.warning("frame %s failed on a GPU worker: %s", name, payload)
+            expected.discard(name)
+            frame_bar.update(1)
+        elif kind == "fatal":
+            LOGGER.error("GPU worker (device %s) failed to initialise: %s", name, payload)
+    for p in procs:
+        p.join(timeout=30)
+    if expected:
+        LOGGER.error("%d frame(s) were not processed: %s",
+                     len(expected), ", ".join(sorted(expected, key=natural_key)))
+    stats_list.sort(key=lambda s: natural_key(s.get("output_name", "")))
+    return stats_list
+
+
+def _flow_worker(gpu_id, args, work_q, result_q) -> None:
+    """Compute WAFT flow maps off ``work_q`` on one GPU."""
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    setup_logging(args.verbose, progress=False)
+    try:
+        runner = WaftFlowRunner(
+            args.waft_root, args.waft_cfg, args.waft_ckpt,
+            "cuda", args.waft_scale, args.flow_max_size,
+        )
+    except Exception as exc:
+        result_q.put(("fatal", str(gpu_id), repr(exc)))
+        return
+    while True:
+        item = work_q.get()
+        if item is None:
+            break
+        out_path, img_a, img_b = item
+        try:
+            flow = runner.flow(img_a, img_b)
+            np.save(out_path, flow)
+            result_q.put(("ok", str(out_path), None))
+        except Exception as exc:
+            result_q.put(("err", str(out_path), repr(exc)))
+
+
+def compute_flows_for_frames_multigpu(selected_frames: Sequence[Path], args, gpus) -> int:
+    """Multi-GPU version of compute_flows_for_frames: shard (source,camera) maps
+    across one worker per GPU. Output .npy files are identical to the single-GPU
+    path; only the device assignment differs."""
+    images_root = args.output_root / "undistorted" / "images"
+    flows_root = args.output_root / "flows"
+    frame_pairs = build_flow_frame_pairs(selected_frames, args.flow_frame_interval)
+    if not frame_pairs:
+        LOGGER.warning(
+            "flow: no frame pairs for --flow_frame_interval=%d over %d selected frames",
+            args.flow_frame_interval, len(selected_frames),
+        )
+        return 0
+
+    # Enumerate the flat work list (mirrors the single-GPU enumeration + resume check).
+    units: list[tuple[Path, Path, Path]] = []
+    pair_meta: list[tuple[str, str, Path, int]] = []
+    for a, b in frame_pairs:
+        dir_a = images_root / a
+        dir_b = images_root / b
+        if not dir_a.exists() or not dir_b.exists():
+            LOGGER.warning("flow: missing undistorted images for %s or %s; skipping pair", a, b)
+            continue
+        files_a = {p.stem: p for p in dir_a.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES}
+        files_b = {p.stem: p for p in dir_b.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES}
+        common = sorted(set(files_a) & set(files_b), key=natural_key)
+        out_dir = flows_root / a
+        out_dir.mkdir(parents=True, exist_ok=True)
+        meta_path = out_dir / "_pair.json"
+        skip_existing_for_pair = False
+        if args.skip_existing_flow and meta_path.exists():
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                skip_existing_for_pair = (
+                    meta.get("source_frame") == a
+                    and meta.get("target_frame") == b
+                    and int(meta.get("flow_frame_interval", 1)) == int(args.flow_frame_interval)
+                )
+            except Exception as exc:
+                LOGGER.warning("flow: failed to read %s for resume check: %s", meta_path, exc)
+        for cam in common:
+            out_path = out_dir / f"{cam}.npy"
+            if not (skip_existing_for_pair and out_path.exists()):
+                units.append((out_path, files_a[cam], files_b[cam]))
+        pair_meta.append((a, b, out_dir, len(common)))
+
+    grand_total = len(units)
+    LOGGER.info("flow: computing %d flow maps over %d frame pairs on %d GPUs",
+                grand_total, len(pair_meta), len(gpus))
+    bar = make_pbar(grand_total, "flow", "map", args.progress)
+
+    if grand_total:
+        ctx = mp.get_context("spawn")
+        work_q = ctx.Queue()
+        result_q = ctx.Queue()
+        for u in units:
+            work_q.put(u)
+        for _ in gpus:
+            work_q.put(None)
+        procs = [ctx.Process(target=_flow_worker, args=(gid, args, work_q, result_q), daemon=False) for gid in gpus]
+        for p in procs:
+            p.start()
+        done = 0
+        errors = 0
+        remaining = grand_total
+        while remaining > 0:
+            try:
+                kind, name, payload = result_q.get(timeout=5.0)
+            except queue_mod.Empty:
+                if not any(p.is_alive() for p in procs):
+                    break
+                continue
+            if kind == "ok":
+                done += 1
+                remaining -= 1
+                bar.update(1)
+            elif kind == "err":
+                errors += 1
+                remaining -= 1
+                bar.update(1)
+                LOGGER.warning("flow failed for %s: %s", name, payload)
+            elif kind == "fatal":
+                LOGGER.error("flow worker (device %s) failed to initialise: %s", name, payload)
+        for p in procs:
+            p.join(timeout=30)
+    else:
+        done = 0
+    bar.close()
+
+    # Write _pair.json once per source frame (parent-side, avoids worker races).
+    for a, b, out_dir, ncommon in pair_meta:
+        (out_dir / "_pair.json").write_text(
+            json.dumps(
+                {"source_frame": a, "target_frame": b, "flow_frame_interval": int(args.flow_frame_interval)},
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    LOGGER.info("flow: wrote %d flow maps under %s", done, flows_root)
+    return done
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Replace COLMAP matcher with SuperPoint+SuperGlue matches.")
     parser.add_argument("--images_root", type=Path, default=Path("data/twopeople/images"))
@@ -2622,6 +2885,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sinkhorn_iterations", type=int, default=20)
     parser.add_argument("--match_threshold", type=float, default=0.2)
     parser.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
+
+    # --- Multi-GPU data parallelism (one worker process per GPU) ---
+    parser.add_argument("--gpus", type=str, default=None,
+                        help="Comma-separated CUDA device indices to fan the per-frame matching and "
+                             "the WAFT flow stage across, e.g. '0,1,2,3' (or 'all'). Each GPU gets its "
+                             "own worker process; frames/flow-maps are independent so output is unchanged. "
+                             "Unset (default) = single-GPU behaviour via --device. Ignored with --device cpu.")
+    parser.add_argument("--colmap_threads", type=int, default=0,
+                        help="Threads per COLMAP mapper/point_triangulator call (--Mapper.num_threads). "
+                             "0 = auto: unlimited on single-GPU, or cpu_count//num_gpus with --gpus (so "
+                             "concurrent COLMAP solves don't oversubscribe the CPU).")
 
     # --- Hardware-utilisation / speed knobs (no algorithmic change) ---
     parser.add_argument("--fp16", action=argparse.BooleanOptionalAction, default=True,
@@ -2748,7 +3022,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     args.output_root.mkdir(parents=True, exist_ok=True)
 
     LOGGER.info("selected frames: %s", ", ".join(p.name for p in selected_frames))
-    matcher = make_matcher(args)
+
+    # Resolve the multi-GPU plan. --gpus only applies to CUDA; on CPU it's ignored.
+    args.gpus_list = parse_gpus(args.gpus) if args.device == "cuda" else []
+    multi_gpu = len(args.gpus_list) > 1
+    if multi_gpu:
+        # Cap COLMAP threads per worker so concurrent solves don't oversubscribe the CPU.
+        args.mapper_num_threads = args.colmap_threads or max(1, (os.cpu_count() or 4) // len(args.gpus_list))
+        # Pin any parent-process CUDA work (the one-time reference solve) to the first GPU.
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpus_list[0])
+        LOGGER.info("multi-GPU enabled: devices %s, %d COLMAP thread(s)/worker",
+                    args.gpus_list, args.mapper_num_threads)
+    else:
+        args.mapper_num_threads = args.colmap_threads
+
+    # The parent only needs a matcher for the single-GPU paths or the static-rig
+    # reference solve; multi-GPU workers each build their own on their card.
+    need_parent_matcher = (not multi_gpu) or args.static_rig
+    matcher = make_matcher(args) if need_parent_matcher else None
     all_stats = []
     frame_bar = make_pbar(len(selected_frames), "frames", "frame", args.progress)
 
@@ -2788,7 +3079,27 @@ def main(argv: Sequence[str] | None = None) -> int:
                 fixed_pairs = None
 
         rig_frames = [f for f in selected_frames if f.name != ref_name]
-        if args.pipeline and len(rig_frames) > 1:
+        if multi_gpu and rig_frames:
+            # Free the parent's reference matcher, then fan the independent per-frame
+            # match+solve out over one worker process per GPU.
+            matcher = None
+            try:
+                import torch as _torch
+                if _torch.cuda.is_available():
+                    _torch.cuda.empty_cache()
+            except Exception:
+                pass
+            LOGGER.info("multi-GPU: matching + triangulating %d frames across GPUs %s",
+                        len(rig_frames), args.gpus_list)
+            ex_info = (
+                (export_ctx.images_root, export_ctx.sparse_dir, export_ctx.crop_by_name)
+                if export_ctx is not None else None
+            )
+            ref_bundle = (ref_cameras, ref_pose_by_name, ref_images_by_name, fixed_pairs, ex_info)
+            all_stats.extend(
+                run_frames_multigpu(rig_frames, args.gpus_list, args, colmap, ref_bundle, frame_bar)
+            )
+        elif args.pipeline and len(rig_frames) > 1:
             # Overlap each frame's CPU/disk solve (triangulate + undistort + crop) with the
             # GPU matching of later frames. Frames are independent (shared fixed poses), so the
             # output is unchanged. A pool of `solver_workers` runs several disk-bound solves
@@ -2823,6 +3134,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
                 all_stats.append(stats)
                 frame_bar.update(1)
+    elif multi_gpu:
+        # Non-rig: every frame is a fully independent reconstruction, so fan them
+        # out over one worker per GPU directly (no shared reference state).
+        LOGGER.info("multi-GPU: reconstructing %d frames across GPUs %s",
+                    len(selected_frames), args.gpus_list)
+        all_stats.extend(
+            run_frames_multigpu(selected_frames, args.gpus_list, args, colmap, None, frame_bar)
+        )
     else:
         for frame_dir in selected_frames:
             frame_bar.set_postfix_str(frame_dir.name)
@@ -2837,24 +3156,33 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not args.undistort:
             LOGGER.warning("--compute_flow needs --undistort (flows are computed on undistorted images); skipping")
         else:
-            del matcher  # free SuperGlue VRAM before loading WAFT
+            matcher = None  # free SuperGlue VRAM before loading WAFT (may already be None)
             try:
                 import torch as _torch
                 if _torch.cuda.is_available():
                     _torch.cuda.empty_cache()
             except Exception:
                 pass
-            runner = None
-            try:
-                runner = WaftFlowRunner(
-                    args.waft_root, args.waft_cfg, args.waft_ckpt,
-                    args.flow_device or args.device, args.waft_scale, args.flow_max_size,
-                )
-            except Exception as exc:
-                LOGGER.warning("WAFT flow stage skipped: %s", exc)
-            if runner is not None:
-                compute_flows_for_frames(selected_frames, args, runner)
-                del runner
+            flow_ran = False
+            if multi_gpu:
+                # Each worker builds its own WaftFlowRunner on its card; if all fail
+                # they log it and no flow files are written (velocity then no-ops).
+                compute_flows_for_frames_multigpu(selected_frames, args, args.gpus_list)
+                flow_ran = True
+            else:
+                runner = None
+                try:
+                    runner = WaftFlowRunner(
+                        args.waft_root, args.waft_cfg, args.waft_ckpt,
+                        args.flow_device or args.device, args.waft_scale, args.flow_max_size,
+                    )
+                except Exception as exc:
+                    LOGGER.warning("WAFT flow stage skipped: %s", exc)
+                if runner is not None:
+                    compute_flows_for_frames(selected_frames, args, runner)
+                    del runner
+                    flow_ran = True
+            if flow_ran:
                 try:
                     import torch as _torch
                     if _torch.cuda.is_available():
