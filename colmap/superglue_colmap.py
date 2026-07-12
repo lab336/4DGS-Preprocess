@@ -317,6 +317,14 @@ def list_images(frame_dir: Path, max_images: int | None = None) -> list[Path]:
 
 
 def image_size(path: Path) -> tuple[int, int]:
+    # PIL reads only the header (no 4K decode); fall back to cv2 if PIL is absent.
+    try:
+        from PIL import Image
+
+        with Image.open(path) as im:
+            return int(im.width), int(im.height)
+    except Exception:
+        pass
     import cv2
 
     img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
@@ -455,6 +463,11 @@ def build_pairs(
     else:
         raise ValueError(f"unsupported pair mode: {mode}")
 
+    return normalize_pairs(pairs, image_names)
+
+
+def normalize_pairs(pairs: Sequence[tuple[str, str]], image_names: Sequence[str]) -> list[tuple[str, str]]:
+    """Dedupe and orient pairs by the image order (a before b)."""
     normalized: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
     order = {name: idx for idx, name in enumerate(image_names)}
@@ -466,6 +479,94 @@ def build_pairs(
             normalized.append(pair)
             seen.add(pair)
     return normalized
+
+
+def load_layout_file(path: Path) -> list[str]:
+    """Read the physical camera order: one camera name (or comma list) per line, '#' comments.
+
+    Entries are matched to images by stem, so '12', '12.png' and 'cam12.jpg' style
+    names all work as long as the stems agree."""
+    stems: list[str] = []
+    seen: set[str] = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        for token in line.replace(",", " ").split():
+            stem = Path(token).stem
+            if stem not in seen:
+                seen.add(stem)
+                stems.append(stem)
+    if len(stems) < 2:
+        raise ValueError(f"--layout_file needs at least two camera names: {path}")
+    return stems
+
+
+def build_layout_pairs(
+    image_names: Sequence[str],
+    layout_stems: Sequence[str],
+    window: int,
+    ring: bool,
+) -> list[tuple[str, str]]:
+    """Pairs restricted to cameras within `window` steps of each other in the
+    user-provided physical order. This both avoids matching look-alike cameras on
+    opposite sides of the rig and cuts the O(N^2) exhaustive pair count."""
+    stem_to_name = {Path(n).stem: n for n in image_names}
+    ordered = [stem_to_name[s] for s in layout_stems if s in stem_to_name]
+    unknown_layout = [s for s in layout_stems if s not in stem_to_name]
+    if unknown_layout:
+        LOGGER.warning(
+            "layout: %d layout entr%s did not match any image (check for typos): %s",
+            len(unknown_layout), "y" if len(unknown_layout) == 1 else "ies",
+            ", ".join(unknown_layout[:10]) + ("..." if len(unknown_layout) > 10 else ""),
+        )
+    layout_set = {Path(n).stem for n in ordered}
+    missing = [n for n in image_names if Path(n).stem not in layout_set]
+    if missing:
+        LOGGER.warning(
+            "layout: %d image(s) not listed in --layout_file are matched against every camera "
+            "(slower but safe): %s",
+            len(missing), ", ".join(missing[:10]) + ("..." if len(missing) > 10 else ""),
+        )
+
+    pairs: list[tuple[str, str]] = []
+    n = len(ordered)
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = j - i
+            if ring and n > 2:
+                d = min(d, n - d)
+            if d <= window:
+                pairs.append((ordered[i], ordered[j]))
+    for name in missing:
+        for other in image_names:
+            if other != name:
+                pairs.append((name, other))
+    return normalize_pairs(pairs, image_names)
+
+
+def load_pair_blacklist(path: Path) -> set[frozenset[str]]:
+    """Read 'nameA nameB' lines (stems, '#' comments) of pairs that must never be matched."""
+    entries: set[frozenset[str]] = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            raise ValueError(f"invalid blacklist line (need two names): {line}")
+        entries.add(frozenset((Path(parts[0]).stem, Path(parts[1]).stem)))
+    return entries
+
+
+def filter_blacklisted_pairs(
+    pairs: Sequence[tuple[str, str]],
+    blacklist: set[frozenset[str]],
+) -> list[tuple[str, str]]:
+    kept = [p for p in pairs if frozenset((Path(p[0]).stem, Path(p[1]).stem)) not in blacklist]
+    if len(kept) != len(pairs):
+        LOGGER.info("pair blacklist removed %d/%d pairs", len(pairs) - len(kept), len(pairs))
+    return kept
 
 
 def build_rig_pairs(
@@ -542,6 +643,55 @@ def build_rig_pairs(
                 out.append((a, b))
     out.sort()
     return [(names[a], names[b]) for a, b in out]
+
+
+_MASK_CACHE: dict[str, "np.ndarray | None"] = {}
+
+
+def load_camera_mask(mask_root: Path, image_name: str) -> "np.ndarray | None":
+    """Per-camera keep/ignore mask (COLMAP convention: zero pixels = ignore keypoints).
+
+    Looks for mask_root/<name>, mask_root/<name>.png, or mask_root/<stem>.<img ext>.
+    Cached process-wide; a static rig has one mask per camera reused across frames."""
+    cache_key = f"{mask_root}|{image_name}"
+    if cache_key in _MASK_CACHE:
+        return _MASK_CACHE[cache_key]
+    import cv2
+
+    stem = Path(image_name).stem
+    candidates = [mask_root / image_name, mask_root / f"{image_name}.png"]
+    candidates += [mask_root / f"{stem}{ext}" for ext in (".png", ".jpg", ".jpeg", ".bmp")]
+    mask = None
+    for cand in candidates:
+        if cand.exists():
+            mask = cv2.imread(str(cand), cv2.IMREAD_GRAYSCALE)
+            if mask is None:
+                LOGGER.warning("mask: failed to read %s; ignoring", cand)
+            break
+    _MASK_CACHE[cache_key] = mask
+    return mask
+
+
+def apply_feature_mask(feat: dict, mask: np.ndarray) -> dict:
+    """Drop detected keypoints whose ORIGINAL-image pixel falls on a zero mask region."""
+    kpts = feat["keypoints"][0]
+    if kpts.shape[0] == 0:
+        return feat
+    import torch
+
+    sx, sy = feat["scales"]
+    xy = kpts.detach().cpu().numpy()
+    xs = np.clip(np.round(xy[:, 0] * sx).astype(np.int64), 0, mask.shape[1] - 1)
+    ys = np.clip(np.round(xy[:, 1] * sy).astype(np.int64), 0, mask.shape[0] - 1)
+    keep_np = mask[ys, xs] > 0
+    if keep_np.all():
+        return feat
+    keep = torch.from_numpy(keep_np).to(kpts.device)
+    out = dict(feat)
+    out["keypoints"] = [feat["keypoints"][0][keep]]
+    out["scores"] = [feat["scores"][0][keep]]
+    out["descriptors"] = [feat["descriptors"][0][:, keep]]
+    return out
 
 
 def process_resize(width: int, height: int, resize: Sequence[int]) -> tuple[int, int]:
@@ -792,6 +942,7 @@ def filter_corrs(
     ransac: bool,
     ransac_max_error: float,
     ransac_confidence: float,
+    min_inlier_ratio: float = 0.0,
 ) -> np.ndarray:
     if corrs.size == 0:
         return np.empty((0, 4), dtype=np.float32)
@@ -818,6 +969,7 @@ def filter_corrs(
     if ransac and len(corrs) >= 8:
         import cv2
 
+        before = len(corrs)
         _, mask = cv2.findFundamentalMat(
             corrs[:, :2],
             corrs[:, 2:],
@@ -827,14 +979,300 @@ def filter_corrs(
         )
         if mask is not None:
             corrs = corrs[mask.ravel() > 0]
+            # A low geometric-inlier ratio is a hallmark of look-alike (but wrong)
+            # image pairs; optionally reject the whole pair.
+            if min_inlier_ratio > 0.0 and len(corrs) < min_inlier_ratio * before:
+                return np.empty((0, 4), dtype=np.float32)
     if len(corrs) < min_matches:
         return np.empty((0, 4), dtype=np.float32)
     return corrs.astype(np.float32, copy=False)
 
 
-def quantized_key(pt: Sequence[float], quantization: float) -> tuple[int, int]:
-    q = max(float(quantization), 1e-6)
-    return (int(round(float(pt[0]) / q)), int(round(float(pt[1]) / q)))
+def rotation_angle_deg(r: np.ndarray) -> float:
+    cos = (float(np.trace(r)) - 1.0) * 0.5
+    return float(np.degrees(np.arccos(np.clip(cos, -1.0, 1.0))))
+
+
+def estimate_relative_rotation(
+    corrs: np.ndarray,
+    info0: ImageInfo,
+    info1: ImageInfo,
+    focal_factor: float,
+    thresh_px: float = 2.0,
+) -> tuple[np.ndarray | None, float]:
+    """Rough relative rotation cam0->cam1 (x1 = R x0 + t) from the essential matrix,
+    using the same focal guess the COLMAP database is initialised with.
+
+    Returns (R, inlier_ratio); R is None when the pair is too weak to score."""
+    import cv2
+
+    corrs = np.asarray(corrs, dtype=np.float64).reshape(-1, 4)
+    if len(corrs) < 15:
+        return None, 0.0
+    f0 = focal_factor * max(info0.width, info0.height)
+    f1 = focal_factor * max(info1.width, info1.height)
+    n0 = np.column_stack(((corrs[:, 0] - info0.width / 2.0) / f0, (corrs[:, 1] - info0.height / 2.0) / f0))
+    n1 = np.column_stack(((corrs[:, 2] - info1.width / 2.0) / f1, (corrs[:, 3] - info1.height / 2.0) / f1))
+    eye = np.eye(3, dtype=np.float64)
+    e, mask = cv2.findEssentialMat(
+        n0, n1, cameraMatrix=eye,
+        method=getattr(cv2, "USAC_MAGSAC", cv2.RANSAC),
+        prob=0.999, threshold=2.0 * thresh_px / (f0 + f1),
+    )
+    if e is None or mask is None:
+        return None, 0.0
+    if e.shape != (3, 3):
+        e = e[:3, :3]
+    inliers = mask.ravel() > 0
+    ratio = float(inliers.sum()) / max(len(corrs), 1)
+    if int(inliers.sum()) < 12:
+        return None, ratio
+    n_pose, r, _, _ = cv2.recoverPose(e, n0[inliers], n1[inliers], cameraMatrix=eye)
+    if n_pose < 12:
+        return None, ratio
+    return np.asarray(r, dtype=np.float64), ratio
+
+
+def cycle_filter_pairs(
+    pair_matches: Sequence[PairMatch],
+    image_infos: dict[str, ImageInfo],
+    focal_factor: float,
+    max_rot_error_deg: float,
+    min_triangles: int,
+    max_triangles_per_edge: int = 12,
+) -> tuple[list[PairMatch], list[dict], int]:
+    """Score every matched pair by rotation cycle consistency and drop outlier pairs.
+
+    Look-alike cameras (symmetric rigs, repetitive texture) produce confident but WRONG
+    pairs that individually pass RANSAC. A wrong pair however cannot compose: for a
+    triangle (a,b,c) the rotations must satisfy R_ca @ R_bc @ R_ab ~ identity. A wrong
+    pair corrupts EVERY triangle it participates in, so even its BEST (minimum-error)
+    triangle is bad, while a good pair keeps at least one clean triangle. Pairs whose
+    minimum cycle error exceeds the threshold are therefore dropped one at a time
+    (worst first, rescoring after each drop so contaminated good pairs recover), and
+    every camera keeps at least 2 pairs so the view graph stays usable."""
+    rot: dict[tuple[str, str], np.ndarray] = {}
+    ratio_by_pair: dict[tuple[str, str], float] = {}
+    for pm in pair_matches:
+        r, ratio = estimate_relative_rotation(pm.matches, image_infos[pm.name0], image_infos[pm.name1], focal_factor)
+        ratio_by_pair[(pm.name0, pm.name1)] = ratio
+        if r is not None:
+            rot[(pm.name0, pm.name1)] = r
+            rot[(pm.name1, pm.name0)] = r.T
+
+    kept_keys: set[tuple[str, str]] = {(pm.name0, pm.name1) for pm in pair_matches}
+    degree: dict[str, int] = {}
+    for a, b in kept_keys:
+        degree[a] = degree.get(a, 0) + 1
+        degree[b] = degree.get(b, 0) + 1
+
+    def score_edges() -> dict[tuple[str, str], tuple[float | None, int]]:
+        """(min cycle error, #triangles) per kept edge with a known rotation."""
+        adj: dict[str, set[str]] = {}
+        for a, b in kept_keys:
+            if (a, b) in rot:
+                adj.setdefault(a, set()).add(b)
+                adj.setdefault(b, set()).add(a)
+        scores: dict[tuple[str, str], tuple[float | None, int]] = {}
+        for a, b in kept_keys:
+            if (a, b) not in rot:
+                scores[(a, b)] = (None, 0)
+                continue
+            common = sorted(adj.get(a, set()) & adj.get(b, set()), key=natural_key)
+            if len(common) > max_triangles_per_edge:
+                idxs = np.linspace(0, len(common) - 1, max_triangles_per_edge).astype(int)
+                common = [common[i] for i in idxs]
+            errs = [
+                rotation_angle_deg(rot[(c, a)] @ rot[(b, c)] @ rot[(a, b)])
+                for c in common
+            ]
+            scores[(a, b)] = (min(errs) if errs else None, len(errs))
+        return scores
+
+    dropped: set[tuple[str, str]] = set()
+    drop_score: dict[tuple[str, str], tuple[float, int]] = {}
+    scores = score_edges()
+    while True:
+        candidates = sorted(
+            ((err, key) for key, (err, n_tri) in scores.items()
+             if err is not None and n_tri >= min_triangles and err > max_rot_error_deg),
+            reverse=True,
+        )
+        removed = False
+        for err, (a, b) in candidates:
+            if degree[a] > 2 and degree[b] > 2:
+                kept_keys.remove((a, b))
+                dropped.add((a, b))
+                drop_score[(a, b)] = (err, scores[(a, b)][1])
+                degree[a] -= 1
+                degree[b] -= 1
+                removed = True
+                break  # rescore: removing a bad edge cleans up its neighbours' triangles
+        if not removed:
+            break
+        scores = score_edges()
+
+    diagnostics: list[dict] = []
+    for pm in pair_matches:
+        key = (pm.name0, pm.name1)
+        err, n_tri = drop_score.get(key) or scores.get(key, (None, 0))
+        diagnostics.append({
+            "name0": pm.name0,
+            "name1": pm.name1,
+            "matches": int(len(pm.matches)),
+            "inlier_ratio": float(ratio_by_pair.get(key, 0.0)),
+            "cycle_err_deg": round(err, 2) if err is not None else None,
+            "triangles": n_tri,
+            "dropped": key in dropped,
+            "_corrs": pm.matches,
+        })
+    kept = [pm for pm in pair_matches if (pm.name0, pm.name1) not in dropped]
+    return kept, diagnostics, len(dropped)
+
+
+def render_pair_preview(
+    path0: Path,
+    path1: Path,
+    corrs: np.ndarray,
+    out_path: Path,
+    label: str,
+    dropped: bool,
+    target_height: int = 720,
+    max_lines: int = 80,
+) -> None:
+    import cv2
+
+    img0 = cv2.imread(str(path0), cv2.IMREAD_COLOR)
+    img1 = cv2.imread(str(path1), cv2.IMREAD_COLOR)
+    if img0 is None or img1 is None:
+        raise RuntimeError(f"failed to read preview images: {path0} / {path1}")
+    s0 = target_height / img0.shape[0]
+    s1 = target_height / img1.shape[0]
+    img0 = cv2.resize(img0, (max(1, int(round(img0.shape[1] * s0))), target_height))
+    img1 = cv2.resize(img1, (max(1, int(round(img1.shape[1] * s1))), target_height))
+    canvas = np.concatenate([img0, img1], axis=1)
+    corrs = np.asarray(corrs, dtype=np.float64).reshape(-1, 4)
+    if len(corrs) > max_lines:
+        corrs = corrs[np.linspace(0, len(corrs) - 1, max_lines).astype(int)]
+    color = (0, 0, 255) if dropped else (0, 200, 0)
+    off = img0.shape[1]
+    for x0, y0, x1, y1 in corrs:
+        p0 = (int(round(x0 * s0)), int(round(y0 * s0)))
+        p1 = (int(round(x1 * s1)) + off, int(round(y1 * s1)))
+        cv2.circle(canvas, p0, 2, color, -1, cv2.LINE_AA)
+        cv2.circle(canvas, p1, 2, color, -1, cv2.LINE_AA)
+        cv2.line(canvas, p0, p1, color, 1, cv2.LINE_AA)
+    cv2.putText(canvas, label, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
+    cv2.putText(canvas, label, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(out_path), canvas, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+
+
+def write_pair_report(
+    report_dir: Path,
+    diagnostics: Sequence[dict],
+    image_infos: dict[str, ImageInfo],
+    max_previews: int,
+    warn_err_deg: float,
+) -> None:
+    """Human-reviewable matching QC: a ranked table plus side-by-side previews of the
+    dropped / most suspicious pairs, so the user can confirm them and extend
+    --pair_blacklist (or fix --layout_file / masks) without rerunning blindly."""
+    report_dir.mkdir(parents=True, exist_ok=True)
+
+    def sort_key(d: dict):
+        err = d["cycle_err_deg"]
+        return (0 if d["dropped"] else 1, -(err if err is not None else -1.0))
+
+    ranked = sorted(diagnostics, key=sort_key)
+    lines = ["# name0 name1 matches inlier_ratio cycle_err_deg triangles status"]
+    for d in ranked:
+        err = "-" if d["cycle_err_deg"] is None else f"{d['cycle_err_deg']:.2f}"
+        lines.append(
+            f"{d['name0']} {d['name1']} {d['matches']} {d['inlier_ratio']:.3f} {err} "
+            f"{d['triangles']} {'DROPPED' if d['dropped'] else 'kept'}"
+        )
+    (report_dir / "pairs_diagnostics.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    suspect_lines = [
+        "# Pairs dropped by the rotation cycle-consistency filter.",
+        "# Review the preview .jpg files, then paste confirmed lines into your --pair_blacklist file.",
+    ]
+    for d in ranked:
+        if d["dropped"]:
+            suspect_lines.append(
+                f"{Path(d['name0']).stem} {Path(d['name1']).stem}  # cycle_err={d['cycle_err_deg']}deg"
+            )
+    (report_dir / "suspect_pairs.txt").write_text("\n".join(suspect_lines) + "\n", encoding="utf-8")
+
+    previews = [
+        d for d in ranked
+        if d["dropped"] or (d["cycle_err_deg"] is not None and d["cycle_err_deg"] >= warn_err_deg)
+    ][: max(0, max_previews)]
+    for i, d in enumerate(previews):
+        status = "dropped" if d["dropped"] else "kept"
+        out = report_dir / f"{i:03d}_{Path(d['name0']).stem}__{Path(d['name1']).stem}_{status}.jpg"
+        try:
+            render_pair_preview(
+                image_infos[d["name0"]].path, image_infos[d["name1"]].path, d["_corrs"], out,
+                f"{d['name0']} | {d['name1']}  matches={d['matches']} inlier={d['inlier_ratio']:.2f} "
+                f"cycle_err={d['cycle_err_deg']}deg [{status.upper()}]",
+                dropped=d["dropped"],
+            )
+        except Exception as exc:
+            LOGGER.warning("pair report: preview failed for %s-%s: %s", d["name0"], d["name1"], exc)
+    n_dropped = sum(1 for d in diagnostics if d["dropped"])
+    LOGGER.info(
+        "pair report: %d dropped / %d pairs, %d preview image(s) -> %s",
+        n_dropped, len(diagnostics), len(previews), report_dir,
+    )
+
+
+def index_pair_matches(
+    image_infos: dict[str, ImageInfo],
+    pair_matches: Sequence[PairMatch],
+    keypoint_quantization: float,
+) -> tuple[dict[str, np.ndarray], list[tuple[str, str, np.ndarray]]]:
+    """Assign per-image keypoint indices to quantized match coordinates (vectorized).
+
+    Coordinates within `keypoint_quantization` px collapse to one keypoint (first
+    occurrence wins), same as the old per-point loop; only the keypoint ordering in
+    the database differs, which COLMAP does not depend on."""
+    chunks: dict[str, list[np.ndarray]] = {name: [] for name in image_infos}
+    lens: dict[str, int] = {name: 0 for name in image_infos}
+    spans: list[tuple[int, int, int]] = []  # per pair: (n, offset0, offset1)
+    for pair in pair_matches:
+        m = np.asarray(pair.matches, dtype=np.float32).reshape(-1, 4)
+        spans.append((len(m), lens[pair.name0], lens[pair.name1]))
+        chunks[pair.name0].append(m[:, 0:2])
+        lens[pair.name0] += len(m)
+        chunks[pair.name1].append(m[:, 2:4])
+        lens[pair.name1] += len(m)
+
+    quant = max(float(keypoint_quantization), 1e-6)
+    keypoints: dict[str, np.ndarray] = {}
+    occurrence_idx: dict[str, np.ndarray] = {}
+    for name, lst in chunks.items():
+        if not lst:
+            keypoints[name] = np.zeros((0, 2), dtype=np.float32)
+            occurrence_idx[name] = np.zeros(0, dtype=np.int64)
+            continue
+        pts = np.concatenate(lst, axis=0)
+        keys = np.round(pts.astype(np.float64) / quant).astype(np.int64)
+        flat = keys[:, 0] * (1 << 32) + keys[:, 1]
+        _, first_idx, inverse = np.unique(flat, return_index=True, return_inverse=True)
+        keypoints[name] = pts[first_idx].astype(np.float32)
+        occurrence_idx[name] = inverse.astype(np.int64)
+
+    indexed_pairs: list[tuple[str, str, np.ndarray]] = []
+    for pair, (n, off0, off1) in zip(pair_matches, spans):
+        if n == 0:
+            continue
+        idx0 = occurrence_idx[pair.name0][off0:off0 + n]
+        idx1 = occurrence_idx[pair.name1][off1:off1 + n]
+        matches = np.unique(np.stack([idx0, idx1], axis=1).astype(np.uint32), axis=0)
+        indexed_pairs.append((pair.name0, pair.name1, matches))
+    return keypoints, indexed_pairs
 
 
 def export_matches_to_database(
@@ -844,26 +1282,7 @@ def export_matches_to_database(
     keypoint_quantization: float,
     two_view_config: int,
 ) -> dict[str, int]:
-    key_maps: dict[str, dict[tuple[int, int], int]] = {name: {} for name in image_infos}
-    keypoints: dict[str, list[tuple[float, float]]] = {name: [] for name in image_infos}
-    indexed_pairs: list[tuple[str, str, np.ndarray]] = []
-
-    for pair in pair_matches:
-        idx_matches: list[tuple[int, int]] = []
-        for x0, y0, x1, y1 in pair.matches:
-            key0 = quantized_key((x0, y0), keypoint_quantization)
-            key1 = quantized_key((x1, y1), keypoint_quantization)
-            map0 = key_maps[pair.name0]
-            map1 = key_maps[pair.name1]
-            if key0 not in map0:
-                map0[key0] = len(keypoints[pair.name0])
-                keypoints[pair.name0].append((float(x0), float(y0)))
-            if key1 not in map1:
-                map1[key1] = len(keypoints[pair.name1])
-                keypoints[pair.name1].append((float(x1), float(y1)))
-            idx_matches.append((map0[key0], map1[key1]))
-        if idx_matches:
-            indexed_pairs.append((pair.name0, pair.name1, np.unique(np.asarray(idx_matches, dtype=np.uint32), axis=0)))
+    keypoints, indexed_pairs = index_pair_matches(image_infos, pair_matches, keypoint_quantization)
 
     con = sqlite3.connect(database_path)
     try:
@@ -872,9 +1291,8 @@ def export_matches_to_database(
         con.execute("DELETE FROM matches")
         con.execute("DELETE FROM two_view_geometries")
 
-        for name, pts in keypoints.items():
+        for name, arr in keypoints.items():
             image_id = image_infos[name].image_id
-            arr = np.asarray(pts, dtype=np.float32).reshape(-1, 2)
             con.execute(
                 "INSERT OR REPLACE INTO keypoints(image_id, rows, cols, data) VALUES (?, ?, ?, ?)",
                 (image_id, int(arr.shape[0]), 2, array_to_blob(arr)),
@@ -908,7 +1326,7 @@ def export_matches_to_database(
             match_count += rows
         con.commit()
         return {
-            "images_with_keypoints": sum(1 for pts in keypoints.values() if pts),
+            "images_with_keypoints": sum(1 for pts in keypoints.values() if len(pts)),
             "keypoints": sum(len(pts) for pts in keypoints.values()),
             "pairs": pair_count,
             "matches": match_count,
@@ -936,12 +1354,48 @@ def model_num_registered_images(model_dir: Path) -> int:
     return 0
 
 
-def run_mapper(colmap: str, database_path: Path, image_dir: Path, sparse_dir: Path, log_dir: Path, args) -> Path:
+def resolve_init_pair(
+    init_pair: Sequence[str] | None,
+    image_infos: dict[str, ImageInfo],
+    label: str,
+) -> tuple[int, int] | None:
+    """Map the user-provided --init_pair names (stem-tolerant) to database image ids."""
+    if not init_pair:
+        return None
+    by_stem = {Path(n).stem: info for n, info in image_infos.items()}
+    infos: list[ImageInfo] = []
+    for token in init_pair:
+        info = image_infos.get(token) or by_stem.get(Path(token).stem)
+        if info is None:
+            LOGGER.warning("%s: --init_pair image '%s' not found; ignoring the hint", label, token)
+            return None
+        infos.append(info)
+    if infos[0].image_id == infos[1].image_id:
+        LOGGER.warning("%s: --init_pair needs two different images; ignoring the hint", label)
+        return None
+    LOGGER.info("%s: mapper seeded with init pair (%s, %s)", label, infos[0].name, infos[1].name)
+    return (infos[0].image_id, infos[1].image_id)
+
+
+def run_mapper(
+    colmap: str,
+    database_path: Path,
+    image_dir: Path,
+    sparse_dir: Path,
+    log_dir: Path,
+    args,
+    init_ids: tuple[int, int] | None = None,
+) -> Path:
     if sparse_dir.exists():
         shutil.rmtree(sparse_dir)
     sparse_dir.mkdir(parents=True, exist_ok=True)
 
     def build_mapper_cmd(multiple_models: bool) -> list[str]:
+        init_args = (
+            ["--Mapper.init_image_id1", str(init_ids[0]), "--Mapper.init_image_id2", str(init_ids[1])]
+            if init_ids is not None
+            else []
+        )
         return [
             colmap,
             "mapper",
@@ -967,7 +1421,7 @@ def run_mapper(colmap: str, database_path: Path, image_dir: Path, sparse_dir: Pa
             str(args.mapper_tri_min_angle),
             "--Mapper.multiple_models",
             "1" if multiple_models else "0",
-        ] + (
+        ] + init_args + (
             ["--Mapper.num_threads", str(args.mapper_num_threads)]
             if getattr(args, "mapper_num_threads", 0)
             else []
@@ -2192,7 +2646,14 @@ def match_frame_pairs(
     resize: Sequence[int] | None = None,
 ) -> tuple[list[PairMatch], dict]:
     if pairs is None:
-        pairs = build_pairs(image_names, args.pair_mode, args.pair_window, args.loop_pairs, args.pairs_file)
+        layout_order = getattr(args, "layout_order", None)
+        if layout_order:
+            pairs = build_layout_pairs(image_names, layout_order, args.layout_window, args.layout_ring)
+        else:
+            pairs = build_pairs(image_names, args.pair_mode, args.pair_window, args.loop_pairs, args.pairs_file)
+    blacklist = getattr(args, "pair_blacklist_set", None)
+    if blacklist:
+        pairs = filter_blacklisted_pairs(pairs, blacklist)
     if args.max_pairs:
         pairs = pairs[: args.max_pairs]
     LOGGER.info("%s: %d image pairs", output_name, len(pairs))
@@ -2203,6 +2664,19 @@ def match_frame_pairs(
     used_names = sorted({n for pair in pairs for n in pair}, key=natural_key)
     feats: dict[str, dict] = {}
     workers = max(1, int(getattr(args, "decode_workers", 4)))
+    mask_root = getattr(args, "mask_root", None)
+    masked_out = 0
+
+    def post_detect(name: str, feat: dict) -> dict:
+        nonlocal masked_out
+        if mask_root is not None:
+            mask = load_camera_mask(mask_root, name)
+            if mask is not None:
+                before = int(feat["keypoints"][0].shape[0])
+                feat = apply_feature_mask(feat, mask)
+                masked_out += before - int(feat["keypoints"][0].shape[0])
+        return feat
+
     dbar = make_pbar(len(used_names), f"detect {output_name}", "img", getattr(args, "progress", True), leave=False, position=1)
     if workers > 1 and len(used_names) > 1:
         prefetch = max(workers, 2)
@@ -2214,31 +2688,63 @@ def match_frame_pairs(
                     n = used_names[next_idx]
                     pending[n] = pool.submit(matcher._decode, image_infos[n].path, resize)
                     next_idx += 1
-                feats[name] = matcher._encode(pending.pop(name).result())
+                feats[name] = post_detect(name, matcher._encode(pending.pop(name).result()))
                 dbar.update(1)
     else:
         for name in used_names:
-            feats[name] = matcher.detect(image_infos[name].path, resize)
+            feats[name] = post_detect(name, matcher.detect(image_infos[name].path, resize))
             dbar.update(1)
     dbar.close()
+    if masked_out:
+        LOGGER.info("%s: masks removed %d keypoints across %d images", output_name, masked_out, len(used_names))
 
     pair_matches: list[PairMatch] = []
     raw_total = 0
     kept_total = 0
     skipped_pairs = 0
-    bar = make_pbar(len(pairs), f"match {output_name}", "pair", getattr(args, "progress", True), leave=False, position=1)
-    for idx, (name0, name1) in enumerate(pairs, start=1):
-        if args.verbose and (idx == 1 or idx % args.log_every == 0):
-            LOGGER.info("%s: matching pair %d/%d (%s, %s)", output_name, idx, len(pairs), name0, name1)
-        raw = matcher.match_cached(feats[name0], feats[name1])
-        raw_total += len(raw)
-        kept = filter_corrs(raw, image_infos[name0], image_infos[name1], args.min_matches, args.ransac, args.ransac_max_error, args.ransac_confidence)
+    min_inlier_ratio = float(getattr(args, "min_inlier_ratio", 0.0))
+    filter_workers = max(1, int(getattr(args, "filter_workers", 2)))
+
+    def consume(entry) -> None:
+        """Collect one filtered pair (FIFO order, so pair_matches keeps the pair order)."""
+        nonlocal kept_total, skipped_pairs
+        name0, name1, fut = entry
+        kept = fut.result() if hasattr(fut, "result") else fut
         kept_total += len(kept)
         if len(kept) >= args.min_matches:
             pair_matches.append(PairMatch(name0=name0, name1=name1, matches=kept))
         else:
             skipped_pairs += 1
-        bar.update(1)
+
+    bar = make_pbar(len(pairs), f"match {output_name}", "pair", getattr(args, "progress", True), leave=False, position=1)
+    # The CPU-side RANSAC filter (cv2 releases the GIL) runs on worker threads so it
+    # overlaps the GPU SuperGlue matching of subsequent pairs; a bounded backlog caps RAM.
+    pool = ThreadPoolExecutor(max_workers=filter_workers) if filter_workers > 1 and len(pairs) > 1 else None
+    inflight: deque = deque()
+    try:
+        for idx, (name0, name1) in enumerate(pairs, start=1):
+            if args.verbose and (idx == 1 or idx % args.log_every == 0):
+                LOGGER.info("%s: matching pair %d/%d (%s, %s)", output_name, idx, len(pairs), name0, name1)
+            raw = matcher.match_cached(feats[name0], feats[name1])
+            raw_total += len(raw)
+            if pool is not None:
+                inflight.append((name0, name1, pool.submit(
+                    filter_corrs, raw, image_infos[name0], image_infos[name1], args.min_matches,
+                    args.ransac, args.ransac_max_error, args.ransac_confidence, min_inlier_ratio,
+                )))
+                while len(inflight) > filter_workers * 4:
+                    consume(inflight.popleft())
+            else:
+                consume((name0, name1, filter_corrs(
+                    raw, image_infos[name0], image_infos[name1], args.min_matches,
+                    args.ransac, args.ransac_max_error, args.ransac_confidence, min_inlier_ratio,
+                )))
+            bar.update(1)
+        while inflight:
+            consume(inflight.popleft())
+    finally:
+        if pool is not None:
+            pool.shutdown(wait=True)
     bar.close()
 
     match_stats = {
@@ -2352,10 +2858,34 @@ def reconstruct_frame(
     if not pair_matches:
         raise RuntimeError(f"{paths.output_name}: SuperGlue produced no valid pairs")
 
+    # Look-alike cameras (symmetric rigs / repetitive texture) yield confident but wrong
+    # pairs that derail the mapper; prune them by rotation cycle consistency and leave a
+    # reviewable report so the user can confirm/extend the blacklist.
+    if getattr(args, "cycle_filter", False) and len(pair_matches) >= 8:
+        pair_matches, cycle_diag, n_dropped = cycle_filter_pairs(
+            pair_matches, image_infos, args.focal_factor,
+            args.cycle_max_rot_error, args.cycle_min_triangles,
+        )
+        match_stats = {**match_stats, "cycle_dropped_pairs": n_dropped}
+        if n_dropped:
+            LOGGER.warning(
+                "%s: cycle-consistency filter dropped %d suspicious pair(s); "
+                "review %s to confirm (paste into --pair_blacklist to make it permanent)",
+                paths.output_name, n_dropped, args.output_root / "pair_report" / paths.output_name,
+            )
+        if not pair_matches:
+            raise RuntimeError(f"{paths.output_name}: no pairs survived cycle-consistency filtering")
+        if getattr(args, "pair_report", False):
+            write_pair_report(
+                args.output_root / "pair_report" / paths.output_name, cycle_diag, image_infos,
+                args.pair_report_max, warn_err_deg=args.cycle_max_rot_error,
+            )
+
     db_stats = export_matches_to_database(paths.database_path, image_infos, pair_matches, args.keypoint_quantization, args.two_view_config)
     LOGGER.info("%s: exported %s", paths.output_name, db_stats)
 
-    model_dir = run_mapper(colmap, paths.database_path, paths.image_dir, paths.sparse_dir, paths.log_dir, args)
+    init_ids = resolve_init_pair(getattr(args, "init_pair", None), image_infos, paths.output_name)
+    model_dir = run_mapper(colmap, paths.database_path, paths.image_dir, paths.sparse_dir, paths.log_dir, args, init_ids)
     mode = "incremental_sfm"
 
     if args.epipolar_filter:
@@ -2366,7 +2896,7 @@ def reconstruct_frame(
         if len(refined) >= 2 and n_out < n_in:
             LOGGER.info("%s: epipolar refine kept %d/%d matches; re-solving poses", paths.output_name, n_out, n_in)
             db_stats = export_matches_to_database(paths.database_path, image_infos, refined, args.keypoint_quantization, args.two_view_config)
-            model_dir = run_mapper(colmap, paths.database_path, paths.image_dir, paths.sparse_dir, paths.log_dir, args)
+            model_dir = run_mapper(colmap, paths.database_path, paths.image_dir, paths.sparse_dir, paths.log_dir, args, init_ids)
             mode = "incremental_sfm_epipolar_refined"
             match_stats = {**match_stats, "epipolar_matches_in": n_in, "epipolar_matches_kept": n_out}
         else:
@@ -2876,6 +3406,48 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--loop_pairs", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--pairs_file", type=Path, default=None)
 
+    # --- Look-alike / ambiguous scene handling (auto pruning + simple user hints) ---
+    parser.add_argument("--layout_file", type=Path, default=None,
+                        help="Physical camera order, one name (or comma list) per line, '#' comments, "
+                             "matched by stem. When given, candidate pairs are limited to cameras within "
+                             "--layout_window steps of each other: look-alike cameras on opposite sides "
+                             "of the rig are never matched, and the exhaustive pair count drops sharply.")
+    parser.add_argument("--layout_window", type=int, default=10,
+                        help="Max distance (in --layout_file order) for two cameras to be paired.")
+    parser.add_argument("--layout_ring", action=argparse.BooleanOptionalAction, default=True,
+                        help="Treat the layout order as a closed ring (last camera neighbours the first).")
+    parser.add_argument("--pair_blacklist", type=Path, default=None,
+                        help="Text file of 'nameA nameB' lines (stems, '#' comments) that must never be "
+                             "matched. pair_report/suspect_pairs.txt is written in this format for reuse.")
+    parser.add_argument("--mask_root", type=Path, default=None,
+                        help="Directory of per-camera masks (<camera>.png; COLMAP convention: zero pixels "
+                             "= ignore keypoints). Paint out repetitive/ambiguous regions once per camera; "
+                             "a static rig reuses the same masks for every frame.")
+    parser.add_argument("--init_pair", type=str, nargs=2, default=None, metavar=("NAME0", "NAME1"),
+                        help="Seed COLMAP mapper with this initial image pair (names or stems). Pick a "
+                             "well-textured, strongly overlapping pair when automatic init picks wrong.")
+    parser.add_argument("--cycle_filter", action=argparse.BooleanOptionalAction, default=True,
+                        help="Drop matched pairs whose relative rotations do not compose to identity "
+                             "around view-graph triangles - the classic signature of look-alike but "
+                             "wrong pairs that individually pass RANSAC.")
+    parser.add_argument("--cycle_max_rot_error", type=float, default=8.0,
+                        help="A pair is dropped when even its BEST view-graph triangle has a rotation "
+                             "cycle error above this many degrees.")
+    parser.add_argument("--cycle_min_triangles", type=int, default=2,
+                        help="Minimum triangles a pair must be scored in before it can be dropped.")
+    parser.add_argument("--pair_report", action=argparse.BooleanOptionalAction, default=True,
+                        help="Write output_root/pair_report/<frame>/: ranked pair table, blacklist-ready "
+                             "suspect_pairs.txt, and side-by-side previews of dropped/suspicious pairs "
+                             "for quick human review.")
+    parser.add_argument("--pair_report_max", type=int, default=40,
+                        help="Max preview images per frame in the pair report.")
+    parser.add_argument("--min_inlier_ratio", type=float, default=0.0,
+                        help="Reject a pair whose RANSAC inlier ratio falls below this (0 disables). "
+                             "Try 0.2-0.35 on rigs with strong look-alike ambiguity.")
+    parser.add_argument("--filter_workers", type=int, default=2,
+                        help="Threads for CPU-side RANSAC match filtering, overlapped with GPU matching "
+                             "(1 disables the overlap; output is unchanged).")
+
     parser.add_argument("--superglue", choices=["indoor", "outdoor"], default="outdoor")
     parser.add_argument("--resize", type=int, nargs="+", default=[2560], help="SuperGlue input resize: max_dim, width height, or -1 for full resolution.")
     parser.add_argument("--resize_float", action="store_true")
@@ -3015,6 +3587,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError("--flow_frame_interval must be positive")
     if args.pairs_file is not None:
         args.pairs_file = args.pairs_file.resolve()
+
+    # User hints for look-alike scenes: parse once, reuse everywhere (workers get them
+    # via the pickled args namespace).
+    args.layout_order = load_layout_file(args.layout_file.resolve()) if args.layout_file else None
+    if args.layout_order:
+        LOGGER.info(
+            "layout: %d cameras, window=%d, ring=%s -> pairs limited to physically adjacent cameras",
+            len(args.layout_order), args.layout_window, args.layout_ring,
+        )
+    args.pair_blacklist_set = load_pair_blacklist(args.pair_blacklist.resolve()) if args.pair_blacklist else set()
+    if args.pair_blacklist_set:
+        LOGGER.info("pair blacklist: %d forbidden pair(s)", len(args.pair_blacklist_set))
+    if args.mask_root is not None:
+        args.mask_root = args.mask_root.resolve()
+        if not args.mask_root.exists():
+            raise FileNotFoundError(f"--mask_root does not exist: {args.mask_root}")
 
     colmap = resolve_colmap(args.colmap)
     frame_dirs = discover_frame_dirs(args.images_root)
