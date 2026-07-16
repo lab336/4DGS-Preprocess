@@ -56,6 +56,25 @@ class ImageInfo:
 
 
 @dataclass(frozen=True)
+class InputImage:
+    """One source image and the stable camera filename used by COLMAP."""
+
+    path: Path
+    output_name: str
+
+
+@dataclass(frozen=True)
+class CameraMajorFrame:
+    """Virtual frame assembled from camera-major input folders."""
+
+    name: str
+    images: tuple[InputImage, ...]
+
+
+FrameInput = Path | CameraMajorFrame
+
+
+@dataclass(frozen=True)
 class PairMatch:
     name0: str
     name1: str
@@ -227,10 +246,32 @@ def parse_gpus(spec: str | None) -> list[int]:
 
 
 def resolve_colmap(colmap_arg: str) -> str:
+    # Prefer a repository-local Windows bundle for the default value.  Conda often
+    # installs a tiny ``Scripts/colmap.BAT`` shim whose hard-coded target becomes
+    # stale when the repository is moved or the bundle is only partly extracted.
+    if colmap_arg == "colmap" and sys.platform == "win32":
+        tools_dir = Path(__file__).resolve().parents[1] / "tools"
+        bundled = sorted(
+            tools_dir.glob("colmap-*/COLMAP.bat"),
+            key=lambda path: natural_key(path.parent.name),
+            reverse=True,
+        )
+        for candidate in bundled:
+            exe = candidate.parent / "bin" / "colmap.exe"
+            if exe.is_file():
+                return str(candidate.resolve())
+
     colmap = shutil.which(colmap_arg) if os.path.basename(colmap_arg) == colmap_arg else colmap_arg
     if not colmap:
-        raise FileNotFoundError("COLMAP was not found in PATH. Use --colmap to point to colmap.exe.")
-    return colmap
+        raise FileNotFoundError(
+            "COLMAP was not found. Install it under tools/colmap-*/ or use "
+            "--colmap to point to COLMAP.bat/colmap.exe."
+        )
+
+    path = Path(colmap).resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"COLMAP launcher does not exist: {path}")
+    return str(path)
 
 
 def run_command(cmd: Sequence[str], log_path: Path | None = None) -> None:
@@ -275,11 +316,53 @@ def discover_frame_dirs(images_root: Path) -> list[Path]:
     return frames
 
 
-def parse_frame_selection(frame_dirs: Sequence[Path], frames_arg: str | None) -> list[Path]:
+def discover_camera_major_frames(images_root: Path) -> tuple[list[CameraMajorFrame], dict[str, str]]:
+    """Transpose ``camera/frame`` input into virtual ``frame/camera.png`` frames.
+
+    Camera folders and images inside each folder are naturally sorted.  All
+    cameras must contain the same number of images; silently dropping unmatched
+    frames would mix capture times and corrupt calibration.
+    """
+    if not images_root.exists():
+        raise FileNotFoundError(f"images root does not exist: {images_root}")
+    camera_dirs = sorted([p for p in images_root.iterdir() if p.is_dir()], key=natural_key)
+    if len(camera_dirs) < 2:
+        raise ValueError(f"camera-major input needs at least two camera folders in {images_root}")
+
+    images_by_camera: list[list[Path]] = []
+    for camera_dir in camera_dirs:
+        images = sorted(
+            [p for p in camera_dir.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES],
+            key=natural_key,
+        )
+        if not images:
+            raise ValueError(f"camera folder contains no images: {camera_dir}")
+        images_by_camera.append(images)
+
+    counts = [len(images) for images in images_by_camera]
+    if len(set(counts)) != 1:
+        details = ", ".join(f"{d.name}={n}" for d, n in zip(camera_dirs, counts))
+        raise ValueError(f"camera folders have different frame counts: {details}")
+
+    mapping = {f"{index}.png": camera_dir.name for index, camera_dir in enumerate(camera_dirs, 1)}
+    frames = [
+        CameraMajorFrame(
+            name=str(frame_index + 1),
+            images=tuple(
+                InputImage(images[frame_index], f"{camera_index}.png")
+                for camera_index, images in enumerate(images_by_camera, 1)
+            ),
+        )
+        for frame_index in range(counts[0])
+    ]
+    return frames, mapping
+
+
+def parse_frame_selection(frame_dirs: Sequence[FrameInput], frames_arg: str | None) -> list[FrameInput]:
     if not frames_arg:
         return list(frame_dirs)
     by_name = {p.name: p for p in frame_dirs}
-    selected: list[Path] = []
+    selected: list[FrameInput] = []
     for token in [x.strip() for x in frames_arg.split(",") if x.strip()]:
         if ":" in token:
             start_s, end_s = token.split(":", 1)
@@ -293,8 +376,8 @@ def parse_frame_selection(frame_dirs: Sequence[Path], frames_arg: str | None) ->
             selected.append(frame_dirs[int(token) - 1])
         else:
             raise ValueError(f"frame '{token}' not found")
-    unique: list[Path] = []
-    seen: set[Path] = set()
+    unique: list[FrameInput] = []
+    seen: set[FrameInput] = set()
     for frame in selected:
         if frame not in seen:
             unique.append(frame)
@@ -304,11 +387,17 @@ def parse_frame_selection(frame_dirs: Sequence[Path], frames_arg: str | None) ->
     return unique
 
 
-def list_images(frame_dir: Path, max_images: int | None = None) -> list[Path]:
-    images = sorted(
-        [p for p in frame_dir.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES],
-        key=natural_key,
-    )
+def list_images(frame_dir: FrameInput, max_images: int | None = None) -> list[InputImage]:
+    if isinstance(frame_dir, CameraMajorFrame):
+        images = list(frame_dir.images)
+    else:
+        images = [
+            InputImage(p, p.name)
+            for p in sorted(
+                [p for p in frame_dir.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES],
+                key=natural_key,
+            )
+        ]
     if max_images is not None:
         images = images[:max_images]
     if len(images) < 2:
@@ -333,14 +422,23 @@ def image_size(path: Path) -> tuple[int, int]:
     return int(img.shape[1]), int(img.shape[0])
 
 
-def stage_images(src_images: Sequence[Path], image_dir: Path, copy_images: bool) -> list[Path]:
+def stage_images(src_images: Sequence[InputImage], image_dir: Path, copy_images: bool) -> list[Path]:
     image_dir.mkdir(parents=True, exist_ok=True)
     staged: list[Path] = []
-    for src in src_images:
-        dst = image_dir / src.name
+    for item in src_images:
+        src = item.path
+        dst = image_dir / item.output_name
         if dst.exists():
             dst.unlink()
-        if copy_images:
+        # Camera-major inputs are normalized to N.png.  Re-encode only when the
+        # source is not already PNG; otherwise preserve bytes via copy/hard link.
+        if src.suffix.lower() != dst.suffix.lower():
+            import cv2
+
+            image = cv2.imread(str(src), cv2.IMREAD_UNCHANGED)
+            if image is None or not cv2.imwrite(str(dst), image):
+                raise RuntimeError(f"failed to convert image to PNG: {src}")
+        elif copy_images:
             shutil.copy2(src, dst)
         else:
             try:
@@ -3029,7 +3127,7 @@ def run_point_triangulator(
 @dataclass
 class RigMatchResult:
     """Output of the GPU matching stage, consumed by the CPU triangulation stage."""
-    frame_dir: Path
+    frame_dir: FrameInput
     paths: "FramePaths"
     image_infos: dict
     pair_matches: list
@@ -3354,6 +3452,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--images_root", type=Path, default=Path("data/twopeople/images"))
     parser.add_argument("--output_root", type=Path, default=Path("output/twopeople_superglue"))
     parser.add_argument("--superglue_root", type=Path, default=Path("colmap/SuperGluePretrainedNetwork"))
+    parser.add_argument("--input_layout", choices=["frames", "cameras"], default="frames",
+                        help="'frames': images_root/frame/camera.png (default); 'cameras': "
+                             "images_root/camera/frame.png, transposed automatically and renamed 1.png, 2.png, ...")
     parser.add_argument("--frames", type=str, default=None, help="Frame folder names or ranges, e.g. '1' or '1:3'.")
     parser.add_argument("--max_images", type=int, default=None, help="Debug limit for images per frame.")
     parser.add_argument("--max_pairs", type=int, default=None, help="Debug limit for image pairs per frame.")
@@ -3605,9 +3706,30 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise FileNotFoundError(f"--mask_root does not exist: {args.mask_root}")
 
     colmap = resolve_colmap(args.colmap)
-    frame_dirs = discover_frame_dirs(args.images_root)
+    LOGGER.info("COLMAP: %s", colmap)
+    camera_mapping: dict[str, str] = {}
+    if args.input_layout == "cameras":
+        frame_dirs, camera_mapping = discover_camera_major_frames(args.images_root)
+        LOGGER.info(
+            "camera-major input: %d cameras x %d frames (outputs named 1.png ... %d.png)",
+            len(camera_mapping), len(frame_dirs), len(camera_mapping),
+        )
+    else:
+        frame_dirs = discover_frame_dirs(args.images_root)
     selected_frames = parse_frame_selection(frame_dirs, args.frames)
     args.output_root.mkdir(parents=True, exist_ok=True)
+
+    if camera_mapping:
+        mapping_path = args.output_root / "camera_mapping.json"
+        mapping_path.write_text(
+            json.dumps(
+                {"images_root": str(args.images_root), "camera_files": camera_mapping},
+                indent=2,
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        LOGGER.info("camera mapping: %s", mapping_path)
 
     LOGGER.info("selected frames: %s", ", ".join(p.name for p in selected_frames))
 

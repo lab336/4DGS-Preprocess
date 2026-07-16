@@ -16,6 +16,18 @@ conda run --no-capture-output -n gsstatic python colmap/superglue_colmap.py `
     --images_root .\data\two\images\ --output_root .\output\two-test `
     --resize -1 `
     --no-compute_velocity --no-compute_flow
+
+
+(gsstatic) PS D:\LS\guassian_static> python colmap\superglue_colmap.py `
+>>   --images_root "Y:\dataset\volygon\teaser\take03\footage\Stills" `
+>>   --input_layout cameras `
+>>   --output_root Y:\dataset\volygon\teaser\take03\calib `
+>>   --frames 1 `
+>>   --device cuda `
+>>   --resize 2560 `
+>>   --no-compute_flow `
+>>   --no-compute_velocity `
+>>   --force
 ---
 
 ## 1. 数据放法
@@ -26,6 +38,20 @@ conda run --no-capture-output -n gsstatic python colmap/superglue_colmap.py `
 data/twopeople/images/1/1.png      # 帧 1，相机 1
 data/twopeople/images/1/2.png      # 帧 1，相机 2
 data/twopeople/images/2/1.png      # 帧 2，相机 1
+```
+
+也支持“每个子目录是一台相机，目录内是一帧或多帧”的布局。加
+`--input_layout cameras` 后，脚本会按自然顺序排列相机目录和各目录内的帧，
+自动转置为逐帧输入；相机图像统一命名为 `1.png、2.png、...`，并在输出根目录
+写入 `camera_mapping.json` 记录数字文件名与原相机目录的对应关系。所有相机目录
+必须具有相同帧数。
+
+```powershell
+python colmap/superglue_colmap.py `
+  --images_root "Y:\dataset\volygon\teaser\take03\footage\Stills" `
+  --input_layout cameras --frames 1 `
+  --output_root output/volygon_take03 `
+  --no-compute_flow --no-compute_velocity --force
 ```
 
 > 光流**不再需要你预先准备**——默认（`--compute_flow`）脚本会用 WAFT 自动生成到 `output_root/flows/`（见第 4 节「一条命令跑通」）。只有在 `--no-compute_flow` 的旧模式下才需要外部光流目录 `--flows_root`（`.npy` 形状 `(H,W,2)`）。

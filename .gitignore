@@ -11,3 +11,4 @@ video/*
 frames1/*
 DJI/*
 *.pyc
+tools/colmap-*/
