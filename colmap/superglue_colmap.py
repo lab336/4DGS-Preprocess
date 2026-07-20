@@ -13,7 +13,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import itertools
-from collections import deque
+from collections import Counter, deque
 import json
 import logging
 import multiprocessing as mp
@@ -319,9 +319,9 @@ def discover_frame_dirs(images_root: Path) -> list[Path]:
 def discover_camera_major_frames(images_root: Path) -> tuple[list[CameraMajorFrame], dict[str, str]]:
     """Transpose ``camera/frame`` input into virtual ``frame/camera.png`` frames.
 
-    Camera folders and images inside each folder are naturally sorted.  All
-    cameras must contain the same number of images; silently dropping unmatched
-    frames would mix capture times and corrupt calibration.
+    Camera folders and images inside each folder are naturally sorted. All
+    cameras must contain the same frame stems in the same order; count-only
+    alignment can silently mix capture times and corrupt calibration.
     """
     if not images_root.exists():
         raise FileNotFoundError(f"images root does not exist: {images_root}")
@@ -330,6 +330,7 @@ def discover_camera_major_frames(images_root: Path) -> tuple[list[CameraMajorFra
         raise ValueError(f"camera-major input needs at least two camera folders in {images_root}")
 
     images_by_camera: list[list[Path]] = []
+    frame_stems_by_camera: list[list[str]] = []
     for camera_dir in camera_dirs:
         images = sorted(
             [p for p in camera_dir.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES],
@@ -337,12 +338,43 @@ def discover_camera_major_frames(images_root: Path) -> tuple[list[CameraMajorFra
         )
         if not images:
             raise ValueError(f"camera folder contains no images: {camera_dir}")
+        frame_stems = [p.stem for p in images]
+        stem_counts = Counter(frame_stems)
+        if len(stem_counts) != len(frame_stems):
+            duplicates = sorted((stem for stem, count in stem_counts.items() if count > 1), key=natural_key)
+            raise ValueError(
+                f"camera folder has duplicate frame stems (usually mixed extensions): "
+                f"{camera_dir}: {', '.join(duplicates[:10])}"
+            )
         images_by_camera.append(images)
+        frame_stems_by_camera.append(frame_stems)
 
     counts = [len(images) for images in images_by_camera]
     if len(set(counts)) != 1:
         details = ", ".join(f"{d.name}={n}" for d, n in zip(camera_dirs, counts))
         raise ValueError(f"camera folders have different frame counts: {details}")
+
+    # Equal counts are not enough: a missing frame plus an unrelated extra frame
+    # would otherwise shift every later capture and silently mix timestamps.
+    reference_stems = frame_stems_by_camera[0]
+    reference_set = set(reference_stems)
+    for camera_dir, stems in zip(camera_dirs[1:], frame_stems_by_camera[1:]):
+        if stems != reference_stems:
+            stem_set = set(stems)
+            missing = sorted(reference_set - stem_set, key=natural_key)
+            extra = sorted(stem_set - reference_set, key=natural_key)
+            detail_parts = []
+            if missing:
+                detail_parts.append(f"missing={','.join(missing[:10])}")
+            if extra:
+                detail_parts.append(f"extra={','.join(extra[:10])}")
+            if not detail_parts:
+                detail_parts.append("frame order differs")
+            raise ValueError(
+                "camera folders must contain the same frame stems in the same natural order; "
+                f"{camera_dir.name} differs from {camera_dirs[0].name} "
+                f"({'; '.join(detail_parts)})"
+            )
 
     mapping = {f"{index}.png": camera_dir.name for index, camera_dir in enumerate(camera_dirs, 1)}
     frames = [
@@ -778,9 +810,19 @@ def apply_feature_mask(feat: dict, mask: np.ndarray) -> dict:
     import torch
 
     sx, sy = feat["scales"]
+    resized_h, resized_w = feat["shape"]
+    original_w = float(resized_w) * float(sx)
+    original_h = float(resized_h) * float(sy)
+    if original_w <= 0 or original_h <= 0 or mask.size == 0:
+        raise ValueError("feature mask and image dimensions must be positive")
     xy = kpts.detach().cpu().numpy()
-    xs = np.clip(np.round(xy[:, 0] * sx).astype(np.int64), 0, mask.shape[1] - 1)
-    ys = np.clip(np.round(xy[:, 1] * sy).astype(np.int64), 0, mask.shape[0] - 1)
+    # Masks may be stored at a lower resolution than the source image. Map through
+    # original-image coordinates instead of clipping all out-of-range points onto
+    # the mask's last row/column (which incorrectly kept or removed large regions).
+    mask_sx = float(mask.shape[1]) / original_w
+    mask_sy = float(mask.shape[0]) / original_h
+    xs = np.clip(np.round(xy[:, 0] * sx * mask_sx).astype(np.int64), 0, mask.shape[1] - 1)
+    ys = np.clip(np.round(xy[:, 1] * sy * mask_sy).astype(np.int64), 0, mask.shape[0] - 1)
     keep_np = mask[ys, xs] > 0
     if keep_np.all():
         return feat
@@ -2858,7 +2900,7 @@ def match_frame_pairs(
 def finalize_frame(
     model_dir: Path,
     paths: FramePaths,
-    frame_dir: Path,
+    frame_dir: FrameInput,
     args,
     colmap: str,
     extra_stats: dict,
@@ -2934,7 +2976,7 @@ def finalize_frame(
 
 
 def reconstruct_frame(
-    frame_dir: Path,
+    frame_dir: FrameInput,
     frame_name: str,
     args,
     colmap: str,
@@ -2956,9 +2998,9 @@ def reconstruct_frame(
     if not pair_matches:
         raise RuntimeError(f"{paths.output_name}: SuperGlue produced no valid pairs")
 
-    # Look-alike cameras (symmetric rigs / repetitive texture) yield confident but wrong
-    # pairs that derail the mapper; prune them by rotation cycle consistency and leave a
-    # reviewable report so the user can confirm/extend the blacklist.
+    # Optional heuristic for look-alike cameras (symmetric rigs / repetitive texture).
+    # It deliberately stays opt-in because the provisional focal length and unrefined
+    # intrinsics used here can make valid wide-angle pairs look cycle-inconsistent.
     if getattr(args, "cycle_filter", False) and len(pair_matches) >= 8:
         pair_matches, cycle_diag, n_dropped = cycle_filter_pairs(
             pair_matches, image_infos, args.focal_factor,
@@ -3135,7 +3177,7 @@ class RigMatchResult:
 
 
 def rig_match_stage(
-    frame_dir: Path,
+    frame_dir: FrameInput,
     frame_name: str,
     args,
     colmap: str,
@@ -3204,7 +3246,7 @@ def rig_solve_stage(
 
 
 def triangulate_frame_with_rig(
-    frame_dir: Path,
+    frame_dir: FrameInput,
     frame_name: str,
     args,
     colmap: str,
@@ -3527,10 +3569,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--init_pair", type=str, nargs=2, default=None, metavar=("NAME0", "NAME1"),
                         help="Seed COLMAP mapper with this initial image pair (names or stems). Pick a "
                              "well-textured, strongly overlapping pair when automatic init picks wrong.")
-    parser.add_argument("--cycle_filter", action=argparse.BooleanOptionalAction, default=True,
-                        help="Drop matched pairs whose relative rotations do not compose to identity "
-                             "around view-graph triangles - the classic signature of look-alike but "
-                             "wrong pairs that individually pass RANSAC.")
+    parser.add_argument("--cycle_filter", action=argparse.BooleanOptionalAction, default=False,
+                        help="Opt-in heuristic: drop matched pairs whose relative rotations do not compose "
+                             "to identity around view-graph triangles. Disabled by default because rotations "
+                             "estimated from provisional intrinsics can reject valid wide-angle pairs.")
     parser.add_argument("--cycle_max_rot_error", type=float, default=8.0,
                         help="A pair is dropped when even its BEST view-graph triangle has a rotation "
                              "cycle error above this many degrees.")
@@ -3686,6 +3728,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError("--velocity_dt must be positive")
     if args.flow_frame_interval <= 0:
         raise ValueError("--flow_frame_interval must be positive")
+    if args.layout_window <= 0:
+        raise ValueError("--layout_window must be positive")
+    if args.cycle_max_rot_error <= 0:
+        raise ValueError("--cycle_max_rot_error must be positive")
+    if args.cycle_min_triangles <= 0:
+        raise ValueError("--cycle_min_triangles must be positive")
+    if not 0.0 <= args.min_inlier_ratio <= 1.0:
+        raise ValueError("--min_inlier_ratio must be between 0 and 1")
+    if args.pair_report_max < 0:
+        raise ValueError("--pair_report_max cannot be negative")
     if args.pairs_file is not None:
         args.pairs_file = args.pairs_file.resolve()
 

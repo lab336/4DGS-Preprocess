@@ -44,7 +44,8 @@ data/twopeople/images/2/1.png      # 帧 2，相机 1
 `--input_layout cameras` 后，脚本会按自然顺序排列相机目录和各目录内的帧，
 自动转置为逐帧输入；相机图像统一命名为 `1.png、2.png、...`，并在输出根目录
 写入 `camera_mapping.json` 记录数字文件名与原相机目录的对应关系。所有相机目录
-必须具有相同帧数。
+必须具有相同帧数，并且帧文件名（忽略扩展名）的集合和自然顺序必须一致；脚本会拒绝
+“数量相同但缺帧位置不同”的输入，避免把不同时间点静默拼成同一帧。
 
 ```powershell
 python colmap/superglue_colmap.py `
@@ -242,31 +243,35 @@ conda run --no-capture-output -n gsstatic python colmap/superglue_colmap.py --fr
 
 > SuperPoint 特征缓存（每张图只检测一次、跨相机对复用）是自动的，参考帧和后续帧都生效，无需开关。
 
-### 相似特征 / 对称场景（自动清理 + 用户辅助）
+### 相似特征 / 对称场景（确定性约束 + 可选启发式）
 
-环形机位下**对称位置的相机看到的内容非常相似**（重复纹理、对称布景、绿幕格子等），SuperGlue 会在这些「长得像但其实不重叠」的相机对之间产生**自信但错误**的匹配，单对的 RANSAC 挡不住，最终 mapper 解出错误位姿或点云重影。脚本现在有一层自动防线 + 四种简单的用户辅助手段：
+环形机位下**对称位置的相机看到的内容非常相似**（重复纹理、对称布景、绿幕格子等），SuperGlue 会在这些「长得像但其实不重叠」的相机对之间产生**自信但错误**的匹配，单对的 RANSAC 挡不住，最终 mapper 解出错误位姿或点云重影。优先使用物理布局、黑名单和掩膜这类确定性约束；旋转环过滤作为可选诊断手段：
 
 | 参数 | 默认 | 说明 |
 | --- | --- | --- |
-| `--cycle_filter` | 开 | **自动防线**：任意三台相机的相对旋转绕一圈应回到原位（R_ca·R_bc·R_ab≈I）。错误对会污染它所在的**每一个**三角形，而正确对至少有一个干净三角形，因此按「最好三角形的环路误差」逐个剔除坏对（每删一个重新评分）。 |
+| `--cycle_filter` | 关 | **可选启发式**：任意三台相机的相对旋转绕一圈应回到原位（R_ca·R_bc·R_ab≈I），据此按「最好三角形的环路误差」逐个剔除可疑对。它依赖尚未优化的猜测焦距，对广角、明显畸变或焦距猜测不准的数据可能误删真实匹配，因此默认关闭；确认需要时显式添加 `--cycle_filter` 并检查报告。 |
 | `--cycle_max_rot_error 8.0` | 8.0 | 剔除阈值（度）。误删好对就调大（12~15），漏删坏对就调小（5~6）。 |
-| `--pair_report` | 开 | 每帧输出 `output_root/pair_report/<帧>/`：`pairs_diagnostics.txt`（全部对的匹配数/内点率/环路误差排名）、`suspect_pairs.txt`（被剔除对，**可直接粘进黑名单**）、以及被剔除/可疑对的**左右拼图连线预览 jpg**——肉眼一翻就知道删得对不对。 |
+| `--pair_report` | 开 | 开启 `--cycle_filter` 时，每帧输出 `output_root/pair_report/<帧>/`：`pairs_diagnostics.txt`（全部对的匹配数/内点率/环路误差排名）、`suspect_pairs.txt`（被剔除对，**可直接粘进黑名单**）、以及被剔除/可疑对的**左右拼图连线预览 jpg**——肉眼一翻就知道删得对不对。 |
 | `--layout_file <文件>` | 无 | **辅助 1（最推荐）**：告诉脚本相机的物理顺序。文本文件按物理环序一行一个相机名（或逗号分隔，`#` 注释，可只写数字不带扩展名）。给了以后只匹配布局上相距 `--layout_window`（默认 10）以内的相机——对面的相似相机**根本不会被配对**，参考帧配对数也从 4950 降到约 1000（更快）。`--layout_ring`（默认开）表示首尾相邻的闭环。 |
 | `--pair_blacklist <文件>` | 无 | **辅助 2**：明确禁止某些相机对。一行两个名字（如 `3 57`）。确认 `pair_report/suspect_pairs.txt` 里的对是错的之后直接粘进来，之后每次运行都生效。 |
-| `--mask_root <目录>` | 无 | **辅助 3**：每台相机一张掩膜图 `<相机名>.png`（COLMAP 惯例：**黑色=0 的区域不取特征点**）。把重复纹理背景/对称布景涂黑一次即可，静态机位所有帧复用同一套掩膜。 |
+| `--mask_root <目录>` | 无 | **辅助 3**：每台相机一张掩膜图 `<相机名>.png`（COLMAP 惯例：**黑色=0 的区域不取特征点**）。把重复纹理背景/对称布景涂黑一次即可，静态机位所有帧复用同一套掩膜；掩膜可以低于原图分辨率，坐标会按比例映射。 |
 | `--init_pair 名0 名1` | 无 | **辅助 4**：指定 mapper 的初始化图像对。当自动初始化选到错误对（`no initial pair` 或初始化就歪了）时，手动挑一对纹理丰富、明显重叠的相机。 |
 | `--min_inlier_ratio 0` | 0=关 | 附加门槛：整对的 RANSAC 内点率低于该值就丢弃全对。歧义严重的机位可试 0.2~0.35。 |
 
 **推荐流程**（遇到「特征接近的图组解不对」时）：
 
 ```powershell
-# 第 1 步：先正常跑一次参考帧，看自动过滤和报告
-conda run --no-capture-output -n gsstatic python colmap/superglue_colmap.py --frames 1 --static_rig --force
+# 第 1 步：优先按物理顺序写 layout.txt，从源头避免对面相机互配
+conda run --no-capture-output -n gsstatic python colmap/superglue_colmap.py --frames 1 --static_rig --force `
+  --layout_file layout.txt
 
-# 第 2 步：打开 output_root/pair_report/1/ 翻预览图 —— 红线=被剔除的可疑对，绿线=保留但误差偏高的对
+# 第 2 步：仍有歧义时显式启用环过滤，再打开 output_root/pair_report/1/ 翻预览图
+#          红线=被剔除的可疑对，绿线=保留但误差偏高的对
 #          确认删对了 -> 把 suspect_pairs.txt 内容粘到 blacklist.txt（一劳永逸）
+conda run --no-capture-output -n gsstatic python colmap/superglue_colmap.py --frames 1 --static_rig --force `
+  --layout_file layout.txt --cycle_filter
 
-# 第 3 步（强烈推荐）：按物理顺序写一个 layout.txt（每行一个相机名），从源头避免对面相机互配
+# 第 3 步：把人工确认后的错误对加入黑名单，再跑正式帧范围
 conda run --no-capture-output -n gsstatic python colmap/superglue_colmap.py --frames 1:201 --static_rig --force `
   --layout_file layout.txt --pair_blacklist blacklist.txt
 
@@ -331,7 +336,7 @@ conda run --no-capture-output -n gsstatic python colmap/superglue_colmap.py --fr
 
 ## 6. 结果不理想时怎么办
 
-**特征相近/对称机位解不对**（相机位置解错、点云重影或「对穿」、mapper 把对面相机当邻居）：见第 5 节「**相似特征 / 对称场景**」。要点：先看 `output_root/pair_report/<参考帧>/` 的预览图确认哪些相机对被自动剔除；确认后粘进 `--pair_blacklist`；最好再写一个 `--layout_file`（按物理顺序一行一个相机名）从源头限制只匹配相邻相机；还不行就 `--mask_root` 涂掉重复背景、`--init_pair` 手动指定初始化对。
+**特征相近/对称机位解不对**（相机位置解错、点云重影或「对穿」、mapper 把对面相机当邻居）：见第 5 节「**相似特征 / 对称场景**」。要点：先写 `--layout_file`（按物理顺序一行一个相机名）从源头限制只匹配相邻相机；需要自动诊断时再加 `--cycle_filter`，查看 `output_root/pair_report/<参考帧>/` 的预览图并人工确认，确认后的错误对粘进 `--pair_blacklist`；还不行就用 `--mask_root` 涂掉重复背景、`--init_pair` 手动指定初始化对。
 
 **点云太空 / COLMAP 报 `no initial pair` / 匹配太少**：放宽匹配和建图门槛。若是初始化选错对导致，直接用 `--init_pair <相机A> <相机B>` 指定一对纹理丰富、明显重叠的相机。
 
