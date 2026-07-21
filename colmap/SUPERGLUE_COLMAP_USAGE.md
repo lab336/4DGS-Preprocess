@@ -40,6 +40,14 @@ data/twopeople/images/1/2.png      # 帧 1，相机 2
 data/twopeople/images/2/1.png      # 帧 2，相机 1
 ```
 
+也支持单帧图片直接平铺在根目录。脚本会自动把整个目录视为一帧，不需要再人为增加一层 `1/` 目录：
+
+```text
+Z:\dataset\雷特世创\images\000000-00-color.png
+Z:\dataset\雷特世创\images\000000-01-color.png
+...
+```
+
 也支持“每个子目录是一台相机，目录内是一帧或多帧”的布局。加
 `--input_layout cameras` 后，脚本会按自然顺序排列相机目录和各目录内的帧，
 自动转置为逐帧输入；相机图像统一命名为 `1.png、2.png、...`，并在输出根目录
@@ -58,6 +66,23 @@ python colmap/superglue_colmap.py `
 > 光流**不再需要你预先准备**——默认（`--compute_flow`）脚本会用 WAFT 自动生成到 `output_root/flows/`（见第 4 节「一条命令跑通」）。只有在 `--no-compute_flow` 的旧模式下才需要外部光流目录 `--flows_root`（`.npy` 形状 `(H,W,2)`）。
 
 `--images_root`、`--output_root` 都有默认值，**只要在仓库根目录运行脚本，就基本不用手动写路径**。
+
+### 使用手工相机矩阵（雷特世创数据推荐）
+
+`preprocess/camera_grid_layout_tool.py` 导出的 `camera_grid.json` 可以直接控制 SuperGlue 的候选相机对。脚本会读取二维位置、物理空洞、四/八邻域、半径以及同位置多相机组；同位置相机互相匹配，并各自连接周边位置。没有手工邻接关系的远端/相似机位不会进入 SuperGlue，从源头降低错误匹配。
+
+当前 64 相机布局生成 210 对候选，而 exhaustive 是 2016 对。正式运行示例：
+
+```powershell
+conda run --no-capture-output -n gsstatic python colmap/superglue_colmap.py `
+  --images_root "Z:\dataset\雷特世创\images" `
+  --camera_layout colmap/camera_grid.json `
+  --output_root output/leitershichuang_manual `
+  --no-compute_flow --no-compute_velocity `
+  --force
+```
+
+也可以把 `--camera_layout` 指向 `colmap/camera_grid_neighbour_pairs.txt`，但推荐 JSON：JSON 能校验全部 64 台相机是否已放置，并能可靠支持同位置多相机。默认 `--camera_layout_unlisted error` 会在某张输入图没有手工邻居时立即报错，避免静默漏标定；确实需要临时兜底时才显式使用 `--camera_layout_unlisted exhaustive`。
 
 ---
 
@@ -104,7 +129,7 @@ conda run -n A2PM-new python colmap/superglue_colmap.py --frames 1 --force
 conda run -n A2PM-new python colmap/superglue_colmap.py --frames 1:3 --force
 ```
 
-> 运行时间提示：**参考帧**用 `exhaustive`（两两全配对）+ 全分辨率解算，最准但最慢（只跑一次）。**后续帧**会自动提速：用参考帧的内外参挑出真正重叠的相机对（共视选对，约 4950→600~900 对），匹配分辨率默认降到 2560（`--rig_resize`），并且每张图的 SuperPoint 特征只算一次复用。整体后续帧通常比参考帧快约 10 倍量级，点云质量基本不变。相关开关见第 5 节。
+> 运行时间提示：不提供 `--camera_layout` 时，**参考帧**默认使用 `exhaustive`；提供手工矩阵后，参考帧和后续帧都只使用该邻接图（当前 64 相机是 210 对），后续帧另用已知位姿做对极清洗。每张图的 SuperPoint 特征只计算一次并在相机对之间复用。相关开关见第 5 节。
 
 ---
 
@@ -236,7 +261,7 @@ conda run --no-capture-output -n gsstatic python colmap/superglue_colmap.py --fr
 
 | 参数 | 默认 | 说明 |
 | --- | --- | --- |
-| `--rig_pair_mode` | covisibility | 后续帧只匹配**真正重叠**的相机对（共视 + 视角相邻），约 4950→600~900 对。想退回每帧全配对用 `--rig_pair_mode same`。 |
+| `--rig_pair_mode` | covisibility | 未提供手工矩阵时，后续帧只匹配**真正重叠**的相机对（共视 + 视角相邻）。提供 `--camera_layout` 后，后续帧会固定复用手工邻接图，此参数不再改变选对结果。 |
 | `--rig_resize 2560` | 2560 | 后续帧的匹配分辨率（位姿已固定，降一点更快）。想后续帧也用全分辨率：`--rig_resize -1`（更慢更细）。 |
 | `--rig_covis_top_k 12` | 12 | 每台相机保留多少个共视最强的邻居。点云偏空就调大（如 18~24，更稳但更慢）。 |
 | `--rig_geo_neighbors 6` | 6 | 每台相机额外按视角相邻补几个邻居，保证物理相邻相机一定匹配（应对人物走动）。 |
@@ -249,10 +274,14 @@ conda run --no-capture-output -n gsstatic python colmap/superglue_colmap.py --fr
 
 | 参数 | 默认 | 说明 |
 | --- | --- | --- |
+| `--camera_layout <JSON/TXT>` | 无 | **辅助 1（当前最推荐）**：直接读取相机矩阵工具导出的 `camera_grid.json` 或邻接对 TXT。支持二维不规则阵列、物理空洞和同位置多相机；启用后覆盖 `--pair_mode`。JSON 中所有当前图片都必须有至少一个邻居。 |
+| `--camera_layout_unlisted` | error | 输入图片没有手工邻居时如何处理：`error` 立即停止；`exhaustive` 将这些图片临时与全部相机配对；`ignore` 保留图片但不匹配。正式标定建议保持 `error`。 |
+| `--registration_rescue` | 开 | 正常求解漏掉某台相机时，只为漏图自动扩展一圈已注册邻居并重试，不会把全部相机改成稠密配对。每次都会写 `output_root/registration_report/<帧>.txt/.json`，列出漏图、有效匹配数和可能原因。用 `--no-registration_rescue` 可关闭。 |
+| `--registration_rescue_max_pairs_per_image 16` | 16 | 每张漏图最多增加多少对外圈邻居；一般无需修改。仍漏图且阵列较稀疏时可调到 24。 |
 | `--cycle_filter` | 关 | **可选启发式**：任意三台相机的相对旋转绕一圈应回到原位（R_ca·R_bc·R_ab≈I），据此按「最好三角形的环路误差」逐个剔除可疑对。它依赖尚未优化的猜测焦距，对广角、明显畸变或焦距猜测不准的数据可能误删真实匹配，因此默认关闭；确认需要时显式添加 `--cycle_filter` 并检查报告。 |
 | `--cycle_max_rot_error 8.0` | 8.0 | 剔除阈值（度）。误删好对就调大（12~15），漏删坏对就调小（5~6）。 |
 | `--pair_report` | 开 | 开启 `--cycle_filter` 时，每帧输出 `output_root/pair_report/<帧>/`：`pairs_diagnostics.txt`（全部对的匹配数/内点率/环路误差排名）、`suspect_pairs.txt`（被剔除对，**可直接粘进黑名单**）、以及被剔除/可疑对的**左右拼图连线预览 jpg**——肉眼一翻就知道删得对不对。 |
-| `--layout_file <文件>` | 无 | **辅助 1（最推荐）**：告诉脚本相机的物理顺序。文本文件按物理环序一行一个相机名（或逗号分隔，`#` 注释，可只写数字不带扩展名）。给了以后只匹配布局上相距 `--layout_window`（默认 10）以内的相机——对面的相似相机**根本不会被配对**，参考帧配对数也从 4950 降到约 1000（更快）。`--layout_ring`（默认开）表示首尾相邻的闭环。 |
+| `--layout_file <文件>` | 无 | 旧的一维环形顺序提示。只适合简单环形阵列；已有 `camera_grid.json` 时不要再使用。 |
 | `--pair_blacklist <文件>` | 无 | **辅助 2**：明确禁止某些相机对。一行两个名字（如 `3 57`）。确认 `pair_report/suspect_pairs.txt` 里的对是错的之后直接粘进来，之后每次运行都生效。 |
 | `--mask_root <目录>` | 无 | **辅助 3**：每台相机一张掩膜图 `<相机名>.png`（COLMAP 惯例：**黑色=0 的区域不取特征点**）。把重复纹理背景/对称布景涂黑一次即可，静态机位所有帧复用同一套掩膜；掩膜可以低于原图分辨率，坐标会按比例映射。 |
 | `--init_pair 名0 名1` | 无 | **辅助 4**：指定 mapper 的初始化图像对。当自动初始化选到错误对（`no initial pair` 或初始化就歪了）时，手动挑一对纹理丰富、明显重叠的相机。 |
@@ -261,19 +290,19 @@ conda run --no-capture-output -n gsstatic python colmap/superglue_colmap.py --fr
 **推荐流程**（遇到「特征接近的图组解不对」时）：
 
 ```powershell
-# 第 1 步：优先按物理顺序写 layout.txt，从源头避免对面相机互配
+# 第 1 步：优先使用相机矩阵工具导出的二维布局，从源头避免远端相机互配
 conda run --no-capture-output -n gsstatic python colmap/superglue_colmap.py --frames 1 --static_rig --force `
-  --layout_file layout.txt
+  --camera_layout colmap/camera_grid.json
 
 # 第 2 步：仍有歧义时显式启用环过滤，再打开 output_root/pair_report/1/ 翻预览图
 #          红线=被剔除的可疑对，绿线=保留但误差偏高的对
 #          确认删对了 -> 把 suspect_pairs.txt 内容粘到 blacklist.txt（一劳永逸）
 conda run --no-capture-output -n gsstatic python colmap/superglue_colmap.py --frames 1 --static_rig --force `
-  --layout_file layout.txt --cycle_filter
+  --camera_layout colmap/camera_grid.json --cycle_filter
 
 # 第 3 步：把人工确认后的错误对加入黑名单，再跑正式帧范围
 conda run --no-capture-output -n gsstatic python colmap/superglue_colmap.py --frames 1:201 --static_rig --force `
-  --layout_file layout.txt --pair_blacklist blacklist.txt
+  --camera_layout colmap/camera_grid.json --pair_blacklist blacklist.txt
 
 # 仍不行：涂掩膜排除重复背景（--mask_root masks/），或手动指定初始化对（--init_pair 12 13）
 ```
@@ -336,7 +365,9 @@ conda run --no-capture-output -n gsstatic python colmap/superglue_colmap.py --fr
 
 ## 6. 结果不理想时怎么办
 
-**特征相近/对称机位解不对**（相机位置解错、点云重影或「对穿」、mapper 把对面相机当邻居）：见第 5 节「**相似特征 / 对称场景**」。要点：先写 `--layout_file`（按物理顺序一行一个相机名）从源头限制只匹配相邻相机；需要自动诊断时再加 `--cycle_filter`，查看 `output_root/pair_report/<参考帧>/` 的预览图并人工确认，确认后的错误对粘进 `--pair_blacklist`；还不行就用 `--mask_root` 涂掉重复背景、`--init_pair` 手动指定初始化对。
+**结果少一台或几台相机**：先看 `output_root/registration_report/<帧>.txt`。报告会明确列出缺失文件名，并区分“布局无邻居”“SuperGlue/RANSAC 无有效对”“有二维匹配但 COLMAP 位姿注册失败”。默认自动补救会只给漏图增加一圈物理邻居后重试；同格位的广角/长焦虽然匹配很多，但因为基线接近零，仍需周边相机提供可三角化的二维到三维对应。
+
+**特征相近/对称机位解不对**（相机位置解错、点云重影或「对穿」、mapper 把对面相机当邻居）：见第 5 节「**相似特征 / 对称场景**」。要点：先用 `--camera_layout colmap/camera_grid.json` 从源头限制只匹配手工确认的相邻机位；需要自动诊断时再加 `--cycle_filter`，查看 `output_root/pair_report/<参考帧>/` 的预览图并人工确认，确认后的错误对粘进 `--pair_blacklist`；还不行就用 `--mask_root` 涂掉重复背景、`--init_pair` 手动指定初始化对。
 
 **点云太空 / COLMAP 报 `no initial pair` / 匹配太少**：放宽匹配和建图门槛。若是初始化选错对导致，直接用 `--init_pair <相机A> <相机B>` 指定一对纹理丰富、明显重叠的相机。
 

@@ -12,3 +12,6 @@ frames1/*
 DJI/*
 *.pyc
 tools/colmap-*/
+*.csv
+*.txt
+*.json

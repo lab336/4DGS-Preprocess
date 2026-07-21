@@ -1,8 +1,12 @@
 """Run COLMAP reconstruction with SuperGlue matches instead of COLMAP matcher.
 
-The script expects a multi-camera frame layout:
+The script accepts a multi-camera frame layout:
 
   data/twopeople/images/<frame_dir>/<camera_image>.png
+
+or a flat single-frame folder containing the camera images directly.  A
+camera-grid JSON exported by ``camera_grid_layout_tool.py`` can restrict
+matching to manually confirmed physical neighbours.
 
 It creates a COLMAP database, writes SuperPoint+SuperGlue keypoints/matches to
 the database, then runs COLMAP mapper/model_converter.
@@ -19,6 +23,7 @@ import logging
 import multiprocessing as mp
 import os
 import queue as queue_mod
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -69,6 +74,19 @@ class CameraMajorFrame:
 
     name: str
     images: tuple[InputImage, ...]
+
+
+@dataclass(frozen=True)
+class ManualCameraLayout:
+    """Camera graph exported by the interactive physical-layout tool."""
+
+    source_path: Path
+    camera_ids: tuple[str, ...]
+    placed_ids: tuple[str, ...]
+    pairs: tuple[tuple[str, str], ...]
+    neighbour_mode: int | None = None
+    neighbour_radius: int | None = None
+    positions: tuple[tuple[int, int, tuple[str, ...]], ...] = ()
 
 
 FrameInput = Path | CameraMajorFrame
@@ -312,7 +330,19 @@ def discover_frame_dirs(images_root: Path) -> list[Path]:
         raise FileNotFoundError(f"images root does not exist: {images_root}")
     frames = sorted([p for p in images_root.iterdir() if p.is_dir()], key=natural_key)
     if not frames:
-        raise FileNotFoundError(f"no frame folders found in {images_root}")
+        direct_images = [
+            path for path in images_root.iterdir()
+            if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES
+        ]
+        if len(direct_images) >= 2:
+            LOGGER.info(
+                "flat single-frame input: using %d images directly under %s",
+                len(direct_images), images_root,
+            )
+            return [images_root]
+        raise FileNotFoundError(
+            f"no frame folders or flat image set (at least two images) found in {images_root}"
+        )
     return frames
 
 
@@ -609,6 +639,363 @@ def normalize_pairs(pairs: Sequence[tuple[str, str]], image_names: Sequence[str]
             normalized.append(pair)
             seen.add(pair)
     return normalized
+
+
+def _slot_camera_ids(slot: object, context: str) -> tuple[bool, list[str]]:
+    """Read both version-1 ``camera_id`` and version-2 ``camera_ids`` slots."""
+    if slot is None:
+        return False, []
+    if not isinstance(slot, dict):
+        raise ValueError(f"{context}: every grid position must be an object or null")
+    enabled = slot.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise ValueError(f"{context}: grid position 'enabled' must be true or false")
+    if "camera_ids" in slot:
+        values = slot["camera_ids"]
+        if not isinstance(values, list) or any(not isinstance(value, str) or not value for value in values):
+            raise ValueError(f"{context}: camera_ids must be a list of non-empty strings")
+        camera_ids = list(values)
+    else:
+        legacy = slot.get("camera_id")
+        camera_ids = [str(legacy)] if legacy else []
+    if len(camera_ids) != len(set(camera_ids)):
+        raise ValueError(f"{context}: a physical position contains a camera more than once")
+    if not enabled and camera_ids:
+        raise ValueError(f"{context}: a disabled physical gap cannot contain cameras")
+    return enabled, camera_ids
+
+
+def _pairs_from_grid_positions(
+    positions: Sequence[tuple[int, int, Sequence[str]]],
+    mode: int,
+    radius: int,
+) -> list[tuple[str, str]]:
+    pairs: list[tuple[str, str]] = []
+    for _row, _column, camera_ids in positions:
+        pairs.extend(itertools.combinations(camera_ids, 2))
+    for (row0, col0, cameras0), (row1, col1, cameras1) in itertools.combinations(positions, 2):
+        dr, dc = abs(row0 - row1), abs(col0 - col1)
+        adjacent = (
+            ((dr == 0 and 0 < dc <= radius) or (dc == 0 and 0 < dr <= radius))
+            if mode == 4
+            else max(dr, dc) <= radius and bool(dr or dc)
+        )
+        if adjacent:
+            pairs.extend((camera0, camera1) for camera0 in cameras0 for camera1 in cameras1)
+
+    unique: list[tuple[str, str]] = []
+    seen: set[frozenset[str]] = set()
+    for camera0, camera1 in pairs:
+        if camera0 == camera1:
+            continue
+        key = frozenset((camera0, camera1))
+        if key not in seen:
+            seen.add(key)
+            unique.append((camera0, camera1))
+    return unique
+
+
+def load_manual_camera_layout(path: Path) -> ManualCameraLayout:
+    """Load camera-grid JSON or its exported neighbour-pairs text file."""
+    path = path.resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"camera layout file does not exist: {path}")
+    if path.suffix.lower() != ".json":
+        camera_ids: list[str] = []
+        seen_ids: set[str] = set()
+        pairs: list[tuple[str, str]] = []
+        seen_pairs: set[frozenset[str]] = set()
+        for line_number, raw_line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
+            line = raw_line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) != 2:
+                raise ValueError(
+                    f"{path}:{line_number}: expected two whitespace-separated camera IDs"
+                )
+            camera0, camera1 = parts
+            if camera0 == camera1:
+                raise ValueError(f"{path}:{line_number}: a camera cannot be paired with itself")
+            key = frozenset((camera0, camera1))
+            if key not in seen_pairs:
+                pairs.append((camera0, camera1))
+                seen_pairs.add(key)
+            for camera_id in parts:
+                if camera_id not in seen_ids:
+                    camera_ids.append(camera_id)
+                    seen_ids.add(camera_id)
+        if not pairs:
+            raise ValueError(f"camera layout pair file contains no usable pairs: {path}")
+        ids = tuple(camera_ids)
+        return ManualCameraLayout(path, ids, ids, tuple(pairs))
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid camera layout JSON {path}: {exc}") from exc
+    if not isinstance(data, dict) or data.get("format") != "camera-grid-layout":
+        raise ValueError(f"not a camera-grid-layout JSON file: {path}")
+    version = data.get("version")
+    if version not in {1, 2}:
+        raise ValueError(f"unsupported camera layout version {version!r}: {path}")
+
+    raw_cameras = data.get("cameras", [])
+    if not isinstance(raw_cameras, list):
+        raise ValueError(f"camera layout 'cameras' must be a list: {path}")
+    camera_ids: list[str] = []
+    seen_cameras: set[str] = set()
+    for item in raw_cameras:
+        if not isinstance(item, dict) or not isinstance(item.get("camera_id"), str) or not item["camera_id"]:
+            raise ValueError(f"camera layout contains an invalid camera item: {path}")
+        camera_id = item["camera_id"]
+        if camera_id in seen_cameras:
+            raise ValueError(f"camera layout contains duplicate camera ID {camera_id!r}: {path}")
+        camera_ids.append(camera_id)
+        seen_cameras.add(camera_id)
+
+    rows = data.get("rows")
+    if not isinstance(rows, list) or not rows:
+        raise ValueError(f"camera layout contains no grid rows: {path}")
+    positions: list[tuple[int, int, Sequence[str]]] = []
+    placed_ids: list[str] = []
+    seen_placed: set[str] = set()
+    for row_index, row in enumerate(rows):
+        if not isinstance(row, list) or not row:
+            raise ValueError(f"camera layout row {row_index + 1} is empty or invalid: {path}")
+        for column_index, slot in enumerate(row):
+            enabled, slot_ids = _slot_camera_ids(
+                slot, f"{path} row {row_index + 1} column {column_index + 1}"
+            )
+            for camera_id in slot_ids:
+                if camera_id not in seen_cameras:
+                    raise ValueError(f"grid position refers to unknown camera {camera_id!r}: {path}")
+                if camera_id in seen_placed:
+                    raise ValueError(f"camera appears in more than one grid position: {camera_id!r}")
+                seen_placed.add(camera_id)
+                placed_ids.append(camera_id)
+            if enabled and slot_ids:
+                positions.append((row_index, column_index, tuple(slot_ids)))
+
+    settings = data.get("neighbour_settings", {})
+    if not isinstance(settings, dict):
+        raise ValueError(f"camera layout neighbour_settings must be an object: {path}")
+    mode = settings.get("mode", 8)
+    radius = settings.get("radius", 1)
+    if mode not in {4, 8}:
+        raise ValueError(f"camera layout neighbour mode must be 4 or 8: {path}")
+    if not isinstance(radius, int) or radius <= 0:
+        raise ValueError(f"camera layout neighbour radius must be a positive integer: {path}")
+    pairs = _pairs_from_grid_positions(positions, mode, radius)
+    if not pairs:
+        raise ValueError(f"camera layout produces no neighbour pairs: {path}")
+    return ManualCameraLayout(
+        path,
+        tuple(camera_ids),
+        tuple(placed_ids),
+        tuple(pairs),
+        mode,
+        radius,
+        tuple((row, column, tuple(ids)) for row, column, ids in positions),
+    )
+
+
+def _camera_name_alias_levels(value: str) -> tuple[set[str], set[str], set[str]]:
+    name = Path(value).name.casefold()
+    stem = Path(name).stem
+    stripped: set[str] = set()
+    match = re.match(r"^\d{2,}[-_](.+)$", stem)
+    if match and match.group(1):
+        stripped.add(match.group(1))
+    return {name}, {stem}, stripped
+
+
+def resolve_manual_camera_names(
+    image_names: Sequence[str],
+    layout: ManualCameraLayout,
+    camera_name_mapping: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Resolve layout camera IDs to current frame image names.
+
+    Resolution prefers exact file name, then stem, then a stable suffix obtained by
+    removing a leading numeric frame token (``000001-03-color`` -> ``03-color``).
+    Camera-major input additionally supplies the generated-name -> camera-folder map.
+    """
+    mapping = camera_name_mapping or {}
+    actual_aliases: dict[str, tuple[set[str], set[str], set[str]]] = {}
+    for image_name in image_names:
+        levels = [set(), set(), set()]
+        labels = [image_name]
+        if image_name in mapping:
+            labels.append(mapping[image_name])
+        for label in labels:
+            for level, aliases in enumerate(_camera_name_alias_levels(label)):
+                levels[level].update(aliases)
+        actual_aliases[image_name] = (levels[0], levels[1], levels[2])
+
+    resolved: dict[str, str] = {}
+    claimed: dict[str, str] = {}
+    for camera_id in layout.camera_ids:
+        manual_levels = _camera_name_alias_levels(camera_id)
+        match_name: str | None = None
+        for level, aliases in enumerate(manual_levels):
+            if not aliases:
+                continue
+            candidates = [
+                image_name for image_name, actual_levels in actual_aliases.items()
+                if aliases & actual_levels[level]
+            ]
+            if len(candidates) > 1:
+                raise ValueError(
+                    f"camera layout ID {camera_id!r} ambiguously matches current images: "
+                    + ", ".join(candidates)
+                )
+            if candidates:
+                match_name = candidates[0]
+                break
+        if match_name is None:
+            continue
+        previous = claimed.get(match_name)
+        if previous is not None and previous != camera_id:
+            raise ValueError(
+                f"camera layout IDs {previous!r} and {camera_id!r} both map to {match_name!r}"
+            )
+        resolved[camera_id] = match_name
+        claimed[match_name] = camera_id
+    return resolved
+
+
+def build_manual_camera_pairs(
+    image_names: Sequence[str],
+    layout: ManualCameraLayout,
+    camera_name_mapping: dict[str, str] | None = None,
+    unlisted_policy: str = "error",
+) -> list[tuple[str, str]]:
+    """Resolve layout camera IDs to current frame names and build the candidate graph."""
+    if unlisted_policy not in {"error", "exhaustive", "ignore"}:
+        raise ValueError(f"unsupported camera-layout unlisted policy: {unlisted_policy}")
+    resolved = resolve_manual_camera_names(image_names, layout, camera_name_mapping)
+
+    raw_pairs = [
+        (resolved[camera0], resolved[camera1])
+        for camera0, camera1 in layout.pairs
+        if camera0 in resolved and camera1 in resolved
+    ]
+    pairs = normalize_pairs(raw_pairs, image_names)
+    paired_names = {name for pair in pairs for name in pair}
+    uncovered = [name for name in image_names if name not in paired_names]
+    unresolved_layout = [camera_id for camera_id in layout.camera_ids if camera_id not in resolved]
+    if unresolved_layout:
+        LOGGER.warning(
+            "camera layout: %d layout camera(s) absent from this frame: %s",
+            len(unresolved_layout),
+            ", ".join(unresolved_layout[:10]) + ("..." if len(unresolved_layout) > 10 else ""),
+        )
+    if uncovered and unlisted_policy == "error":
+        raise ValueError(
+            "camera layout leaves current images unmapped or without any neighbour: "
+            + ", ".join(uncovered[:20])
+            + ("..." if len(uncovered) > 20 else "")
+            + ". Fix the layout, or explicitly use --camera_layout_unlisted exhaustive/ignore."
+        )
+    if uncovered and unlisted_policy == "exhaustive":
+        expanded = list(pairs)
+        for image_name in uncovered:
+            expanded.extend((image_name, other) for other in image_names if other != image_name)
+        pairs = normalize_pairs(expanded, image_names)
+        LOGGER.warning(
+            "camera layout: %d uncovered image(s) use exhaustive fallback", len(uncovered)
+        )
+    elif uncovered:
+        LOGGER.warning(
+            "camera layout: ignoring %d image(s) without a manual neighbour: %s",
+            len(uncovered), ", ".join(uncovered[:10]) + ("..." if len(uncovered) > 10 else ""),
+        )
+    if not pairs:
+        raise ValueError("camera layout produced no usable pairs for the current frame")
+    mapped_count = len(set(resolved.values()))
+    LOGGER.info(
+        "camera layout: mapped %d/%d images, %d covered by pairs -> %d manual candidate pairs",
+        mapped_count, len(image_names), len(image_names) - len(uncovered), len(pairs),
+    )
+    return pairs
+
+
+def manual_colocated_images(
+    image_names: Sequence[str],
+    layout: ManualCameraLayout | None,
+    camera_name_mapping: dict[str, str] | None = None,
+) -> dict[str, tuple[str, ...]]:
+    """Return other images assigned to the same physical grid position."""
+    if layout is None or not layout.positions:
+        return {}
+    resolved = resolve_manual_camera_names(image_names, layout, camera_name_mapping)
+    colocated: dict[str, tuple[str, ...]] = {}
+    for _row, _column, camera_ids in layout.positions:
+        names = tuple(resolved[camera_id] for camera_id in camera_ids if camera_id in resolved)
+        for name in names:
+            others = tuple(other for other in names if other != name)
+            if others:
+                colocated[name] = others
+    return colocated
+
+
+def build_registration_rescue_pairs(
+    image_names: Sequence[str],
+    base_pairs: Sequence[tuple[str, str]],
+    missing_names: Sequence[str],
+    registered_names: set[str],
+    hops: int = 2,
+    max_pairs_per_image: int = 16,
+) -> list[tuple[str, str]]:
+    """Expand failed cameras through the view graph to registered cameras.
+
+    With a radius-one grid, two graph hops approximate one additional physical
+    ring.  Expanding only failed cameras avoids the cost and ambiguity of making
+    the full camera graph denser.
+    """
+    if hops < 2 or max_pairs_per_image <= 0:
+        return []
+    normalized = normalize_pairs(base_pairs, image_names)
+    adjacency = {name: set() for name in image_names}
+    existing = {frozenset(pair) for pair in normalized}
+    for name0, name1 in normalized:
+        adjacency[name0].add(name1)
+        adjacency[name1].add(name0)
+
+    rescue: list[tuple[str, str]] = []
+    for missing in sorted(set(missing_names), key=natural_key):
+        if missing not in adjacency:
+            continue
+        distances = {missing: 0}
+        frontier = {missing}
+        for distance in range(1, hops + 1):
+            next_frontier: set[str] = set()
+            for current in frontier:
+                for neighbour in adjacency[current]:
+                    if neighbour not in distances:
+                        distances[neighbour] = distance
+                        next_frontier.add(neighbour)
+            frontier = next_frontier
+            if not frontier:
+                break
+
+        direct = adjacency[missing]
+        ranked = []
+        for candidate, distance in distances.items():
+            pair_key = frozenset((missing, candidate))
+            if (
+                distance < 2
+                or candidate not in registered_names
+                or candidate == missing
+                or pair_key in existing
+            ):
+                continue
+            shared_neighbours = len(direct & adjacency[candidate])
+            ranked.append((distance, -shared_neighbours, natural_key(candidate), candidate))
+        ranked.sort()
+        rescue.extend((missing, entry[-1]) for entry in ranked[:max_pairs_per_image])
+    return normalize_pairs(rescue, image_names)
 
 
 def load_layout_file(path: Path) -> list[str]:
@@ -1475,6 +1862,175 @@ def export_matches_to_database(
         con.close()
 
 
+def append_matches_to_database(
+    database_path: Path,
+    image_infos: dict[str, ImageInfo],
+    pair_matches: Sequence[PairMatch],
+    keypoint_quantization: float,
+    two_view_config: int,
+) -> dict[str, int]:
+    """Append new pairs without renumbering existing database keypoints.
+
+    Preserving keypoint indices is essential when the database is used with an
+    already reconstructed model: its POINT2D_IDX values refer to those indices.
+    """
+    if not pair_matches:
+        return {"new_keypoints": 0, "pairs": 0, "matches": 0}
+    quant = max(float(keypoint_quantization), 1e-6)
+    used_names = {name for pair in pair_matches for name in (pair.name0, pair.name1)}
+    con = sqlite3.connect(database_path)
+    try:
+        points_by_name: dict[str, list[tuple[float, float]]] = {}
+        index_by_name: dict[str, dict[tuple[int, int], int]] = {}
+        initial_counts: dict[str, int] = {}
+        for name in used_names:
+            info = image_infos[name]
+            row = con.execute(
+                "SELECT rows, cols, data FROM keypoints WHERE image_id = ?", (info.image_id,)
+            ).fetchone()
+            if row is None:
+                array = np.empty((0, 2), dtype=np.float32)
+            else:
+                rows, cols, blob = int(row[0]), int(row[1]), row[2]
+                array = np.frombuffer(blob, dtype=np.float32).reshape(rows, cols)[:, :2].copy()
+            points = [(float(x), float(y)) for x, y in array]
+            indices: dict[tuple[int, int], int] = {}
+            for index, (x, y) in enumerate(points):
+                key = tuple(np.rint(np.asarray([x, y]) / quant).astype(np.int64))
+                indices[key] = index
+            points_by_name[name] = points
+            index_by_name[name] = indices
+            initial_counts[name] = len(points)
+
+        indexed_pairs: list[tuple[str, str, np.ndarray]] = []
+        for pair in pair_matches:
+            indices = []
+            for x0, y0, x1, y1 in np.asarray(pair.matches).reshape(-1, 4):
+                pair_indices = []
+                for name, x, y in ((pair.name0, x0, y0), (pair.name1, x1, y1)):
+                    key = tuple(np.rint(np.asarray([x, y], dtype=np.float64) / quant).astype(np.int64))
+                    index = index_by_name[name].get(key)
+                    if index is None:
+                        index = len(points_by_name[name])
+                        index_by_name[name][key] = index
+                        points_by_name[name].append((float(x), float(y)))
+                    pair_indices.append(index)
+                indices.append(tuple(pair_indices))
+            matches = np.unique(np.asarray(indices, dtype=np.uint32).reshape(-1, 2), axis=0)
+            if len(matches):
+                indexed_pairs.append((pair.name0, pair.name1, matches))
+
+        for name, points in points_by_name.items():
+            array = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+            con.execute(
+                "INSERT OR REPLACE INTO keypoints(image_id, rows, cols, data) VALUES (?, ?, ?, ?)",
+                (image_infos[name].image_id, int(array.shape[0]), 2, array_to_blob(array)),
+            )
+
+        eye3 = array_to_blob(np.eye(3, dtype=np.float64))
+        qvec = array_to_blob(np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float64))
+        tvec = array_to_blob(np.zeros(3, dtype=np.float64))
+        match_count = 0
+        for name0, name1, matches in indexed_pairs:
+            info0, info1 = image_infos[name0], image_infos[name1]
+            if info0.image_id < info1.image_id:
+                image_id0, image_id1, stored = info0.image_id, info1.image_id, matches
+            else:
+                image_id0, image_id1, stored = info1.image_id, info0.image_id, matches[:, ::-1].copy()
+            pair_id = image_ids_to_pair_id(image_id0, image_id1)
+            blob = array_to_blob(stored.astype(np.uint32, copy=False))
+            rows = int(stored.shape[0])
+            con.execute(
+                "INSERT OR REPLACE INTO matches(pair_id, rows, cols, data) VALUES (?, ?, ?, ?)",
+                (pair_id, rows, 2, blob),
+            )
+            con.execute(
+                "INSERT OR REPLACE INTO two_view_geometries"
+                "(pair_id, rows, cols, data, config, F, E, H, qvec, tvec) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (pair_id, rows, 2, blob, two_view_config, eye3, eye3, eye3, qvec, tvec),
+            )
+            match_count += rows
+        con.commit()
+        return {
+            "new_keypoints": sum(len(points_by_name[name]) - initial_counts[name] for name in used_names),
+            "pairs": len(indexed_pairs),
+            "matches": match_count,
+        }
+    finally:
+        con.close()
+
+
+def prepare_model_for_appended_keypoints(
+    source_model_txt: Path,
+    database_path: Path,
+    output_model_txt: Path,
+) -> Path:
+    """Extend registered images with newly appended, untriangulated keypoints.
+
+    COLMAP requires every registered image's POINTS2D array to have exactly the
+    same length as its database keypoint row.  New entries are appended with a
+    point3D id of -1, preserving all existing observation indices.
+    """
+    if output_model_txt.exists():
+        shutil.rmtree(output_model_txt)
+    output_model_txt.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source_model_txt / "cameras.txt", output_model_txt / "cameras.txt")
+    shutil.copy2(source_model_txt / "points3D.txt", output_model_txt / "points3D.txt")
+
+    con = sqlite3.connect(database_path)
+    try:
+        keypoints_by_image_id: dict[int, np.ndarray] = {}
+        for image_id, rows, cols, blob in con.execute(
+            "SELECT image_id, rows, cols, data FROM keypoints"
+        ):
+            keypoints_by_image_id[int(image_id)] = (
+                np.frombuffer(blob, dtype=np.float32).reshape(int(rows), int(cols))[:, :2]
+            )
+    finally:
+        con.close()
+
+    source_lines = (source_model_txt / "images.txt").read_text(
+        encoding="utf-8", errors="strict"
+    ).splitlines()
+    output_lines: list[str] = []
+    index = 0
+    while index < len(source_lines):
+        header = source_lines[index]
+        output_lines.append(header)
+        index += 1
+        stripped = header.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        parts = stripped.split()
+        if len(parts) < 10:
+            raise ValueError(f"invalid COLMAP images.txt header: {header}")
+        image_id = int(parts[0])
+        points_line = source_lines[index] if index < len(source_lines) else ""
+        index += 1
+        point_tokens = points_line.split()
+        if len(point_tokens) % 3:
+            raise ValueError(f"invalid COLMAP POINTS2D line for image {image_id}")
+        old_count = len(point_tokens) // 3
+        database_points = keypoints_by_image_id.get(image_id)
+        if database_points is None or len(database_points) < old_count:
+            raise ValueError(
+                f"database/model keypoint mismatch for image {image_id}: "
+                f"database={0 if database_points is None else len(database_points)}, model={old_count}"
+            )
+        if len(database_points) > old_count:
+            additions = " ".join(
+                f"{float(x):.9g} {float(y):.9g} -1"
+                for x, y in database_points[old_count:]
+            )
+            points_line = f"{points_line} {additions}".strip()
+        output_lines.append(points_line)
+    (output_model_txt / "images.txt").write_text(
+        "\n".join(output_lines) + "\n", encoding="utf-8"
+    )
+    return output_model_txt
+
+
 def model_num_registered_images(model_dir: Path) -> int:
     images_bin = model_dir / "images.bin"
     if images_bin.exists():
@@ -1595,6 +2151,54 @@ def run_mapper(
         sizes = {p.name: model_num_registered_images(p) for p in sorted(models, key=natural_key)}
         LOGGER.info("mapper produced %d models %s; selected '%s'", len(models), sizes, best.name)
     return best
+
+
+def run_image_registrator(
+    colmap: str,
+    database_path: Path,
+    input_model: Path,
+    output_model: Path,
+    log_dir: Path,
+    args,
+) -> Path:
+    """Try to attach missing images to an existing, stable reconstruction."""
+    if output_model.exists():
+        shutil.rmtree(output_model)
+    output_model.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        colmap,
+        "image_registrator",
+        "--database_path",
+        str(database_path),
+        "--input_path",
+        str(input_model),
+        "--output_path",
+        str(output_model),
+        "--Mapper.min_num_matches",
+        str(args.mapper_min_num_matches),
+        "--Mapper.abs_pose_min_num_inliers",
+        str(args.mapper_abs_pose_min_num_inliers),
+        "--Mapper.abs_pose_max_error",
+        str(args.registration_rescue_abs_pose_max_error),
+        "--Mapper.abs_pose_min_inlier_ratio",
+        str(args.registration_rescue_abs_pose_min_inlier_ratio),
+        "--Mapper.max_reg_trials",
+        str(args.registration_rescue_max_trials),
+        "--Mapper.ba_refine_focal_length",
+        "1" if args.ba_refine_focal_length else "0",
+        "--Mapper.ba_refine_principal_point",
+        "1" if args.ba_refine_principal_point else "0",
+        "--Mapper.fix_existing_frames",
+        "1",
+        "--Mapper.multiple_models",
+        "0",
+    ]
+    if getattr(args, "mapper_num_threads", 0):
+        cmd += ["--Mapper.num_threads", str(args.mapper_num_threads)]
+    run_command(cmd, log_dir / "image_registrator_rescue.log")
+    if not (output_model / "images.bin").exists() and not (output_model / "images.txt").exists():
+        raise RuntimeError(f"COLMAP image_registrator produced no model in {output_model}")
+    return output_model
 
 
 def export_model_txt(colmap: str, model_dir: Path, txt_dir: Path, log_dir: Path) -> None:
@@ -2786,10 +3390,19 @@ def match_frame_pairs(
     resize: Sequence[int] | None = None,
 ) -> tuple[list[PairMatch], dict]:
     if pairs is None:
-        layout_order = getattr(args, "layout_order", None)
-        if layout_order:
-            pairs = build_layout_pairs(image_names, layout_order, args.layout_window, args.layout_ring)
+        manual_layout = getattr(args, "manual_camera_layout", None)
+        if manual_layout is not None:
+            pairs = build_manual_camera_pairs(
+                image_names,
+                manual_layout,
+                getattr(args, "camera_name_mapping", None),
+                args.camera_layout_unlisted,
+            )
         else:
+            layout_order = getattr(args, "layout_order", None)
+        if manual_layout is None and layout_order:
+            pairs = build_layout_pairs(image_names, layout_order, args.layout_window, args.layout_ring)
+        elif manual_layout is None:
             pairs = build_pairs(image_names, args.pair_mode, args.pair_window, args.loop_pairs, args.pairs_file)
     blacklist = getattr(args, "pair_blacklist_set", None)
     if blacklist:
@@ -2897,6 +3510,123 @@ def match_frame_pairs(
     return pair_matches, match_stats
 
 
+def write_registration_report(
+    report_root: Path,
+    output_name: str,
+    image_names: Sequence[str],
+    candidate_pairs: Sequence[tuple[str, str]],
+    pair_matches: Sequence[PairMatch],
+    registered_names: set[str],
+    initial_registered_names: set[str],
+    rescue_pairs: Sequence[tuple[str, str]],
+    rescue_matches: Sequence[PairMatch],
+    colocated: dict[str, tuple[str, ...]],
+) -> dict:
+    """Persist an actionable per-camera registration diagnosis outside the workspace."""
+    report_root.mkdir(parents=True, exist_ok=True)
+    all_candidates = normalize_pairs([*candidate_pairs, *rescue_pairs], image_names)
+    candidate_neighbours = {name: set() for name in image_names}
+    for name0, name1 in all_candidates:
+        candidate_neighbours[name0].add(name1)
+        candidate_neighbours[name1].add(name0)
+
+    valid_edges: dict[str, list[tuple[str, int]]] = {name: [] for name in image_names}
+    for pair in pair_matches:
+        count = int(len(pair.matches))
+        valid_edges[pair.name0].append((pair.name1, count))
+        valid_edges[pair.name1].append((pair.name0, count))
+
+    image_entries = []
+    for name in image_names:
+        neighbours = sorted(candidate_neighbours[name], key=natural_key)
+        valid = sorted(valid_edges[name], key=lambda item: natural_key(item[0]))
+        registered_valid = [(other, count) for other, count in valid if other in registered_names]
+        same_position = list(colocated.get(name, ()))
+        status = "registered" if name in registered_names else "unregistered"
+        reason_code: str | None = None
+        reason: str | None = None
+        if status == "unregistered":
+            if not neighbours:
+                reason_code = "NO_CANDIDATE_PAIRS"
+                reason = "相机布局没有给该图像提供候选邻居。"
+            elif not valid:
+                reason_code = "NO_VALID_MATCH_PAIRS"
+                reason = "候选邻居存在，但 SuperGlue + RANSAC 后没有一对达到有效匹配阈值。"
+            elif not registered_valid:
+                reason_code = "NO_REGISTERED_MATCHED_NEIGHBOURS"
+                reason = "有二维匹配，但有效邻居均未进入最终模型，无法形成稳定的二维到三维对应。"
+            else:
+                reason_code = "COLMAP_POSE_REGISTRATION_FAILED"
+                reason = (
+                    "与已注册邻居存在有效二维匹配，但 COLMAP 仍未通过绝对位姿注册；"
+                    "通常表示可复用的三维点不足、视差过小、焦距初值偏差较大，或几何对应不一致。"
+                )
+            if same_position:
+                reason += " 同格位相机为 " + ", ".join(same_position) + "；同位置匹配本身几乎没有三角化基线。"
+        image_entries.append(
+            {
+                "name": name,
+                "status": status,
+                "candidate_pair_count": len(neighbours),
+                "valid_pair_count": len(valid),
+                "filtered_match_count": sum(count for _other, count in valid),
+                "registered_valid_neighbour_count": len(registered_valid),
+                "same_position_images": same_position,
+                "valid_pairs": [
+                    {"other": other, "matches": count, "other_registered": other in registered_names}
+                    for other, count in valid
+                ],
+                "reason_code": reason_code,
+                "likely_reason": reason,
+            }
+        )
+
+    missing = [entry for entry in image_entries if entry["status"] == "unregistered"]
+    rescued = sorted(registered_names - initial_registered_names, key=natural_key)
+    report = {
+        "frame": output_name,
+        "total_images": len(image_names),
+        "registered_images": len(registered_names),
+        "unregistered_images": [entry["name"] for entry in missing],
+        "initial_unregistered_images": sorted(set(image_names) - initial_registered_names, key=natural_key),
+        "rescued_images": rescued,
+        "rescue_candidate_pairs": len(rescue_pairs),
+        "rescue_valid_pairs": len(rescue_matches),
+        "rescue_filtered_matches": sum(len(pair.matches) for pair in rescue_matches),
+        "images": image_entries,
+    }
+    json_path = report_root / f"{output_name}.json"
+    text_path = report_root / f"{output_name}.txt"
+    json_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    lines = [
+        f"相机注册报告 / Camera registration report: {output_name}",
+        f"注册结果: {len(registered_names)}/{len(image_names)}",
+        f"自动补救: {len(rescue_pairs)} 个候选对, {len(rescue_matches)} 个有效对, "
+        f"补回 {len(rescued)} 张 ({', '.join(rescued) if rescued else '无'})",
+        "",
+    ]
+    if not missing:
+        lines.append("全部图像均已注册。")
+    else:
+        lines.append("未注册图像:")
+        for entry in missing:
+            lines.extend(
+                [
+                    f"- {entry['name']}",
+                    f"  原因代码: {entry['reason_code']}",
+                    f"  可能原因: {entry['likely_reason']}",
+                    f"  候选对/有效对/有效匹配: {entry['candidate_pair_count']}/"
+                    f"{entry['valid_pair_count']}/{entry['filtered_match_count']}",
+                    "  有效邻居: "
+                    + (", ".join(f"{pair['other']}({pair['matches']})" for pair in entry["valid_pairs"]) or "无"),
+                ]
+            )
+    # UTF-8 BOM keeps Chinese readable in Windows Notepad and Windows PowerShell 5.
+    text_path.write_text("\n".join(lines) + "\n", encoding="utf-8-sig")
+    return report
+
+
 def finalize_frame(
     model_dir: Path,
     paths: FramePaths,
@@ -2994,7 +3724,30 @@ def reconstruct_frame(
     image_infos = create_colmap_database(paths.database_path, staged_images, args.camera_model, args.focal_factor, args.single_camera)
 
     image_names = [p.name for p in staged_images]
-    pair_matches, match_stats = match_frame_pairs(image_names, image_infos, matcher, args, paths.output_name)
+    manual_layout = getattr(args, "manual_camera_layout", None)
+    if manual_layout is not None:
+        candidate_pairs = build_manual_camera_pairs(
+            image_names,
+            manual_layout,
+            getattr(args, "camera_name_mapping", None),
+            args.camera_layout_unlisted,
+        )
+    elif getattr(args, "layout_order", None):
+        candidate_pairs = build_layout_pairs(
+            image_names, args.layout_order, args.layout_window, args.layout_ring
+        )
+    else:
+        candidate_pairs = build_pairs(
+            image_names, args.pair_mode, args.pair_window, args.loop_pairs, args.pairs_file
+        )
+    if getattr(args, "pair_blacklist_set", None):
+        candidate_pairs = filter_blacklisted_pairs(candidate_pairs, args.pair_blacklist_set)
+    if args.max_pairs:
+        candidate_pairs = candidate_pairs[: args.max_pairs]
+
+    pair_matches, match_stats = match_frame_pairs(
+        image_names, image_infos, matcher, args, paths.output_name, pairs=candidate_pairs
+    )
     if not pair_matches:
         raise RuntimeError(f"{paths.output_name}: SuperGlue produced no valid pairs")
 
@@ -3038,11 +3791,164 @@ def reconstruct_frame(
             db_stats = export_matches_to_database(paths.database_path, image_infos, refined, args.keypoint_quantization, args.two_view_config)
             model_dir = run_mapper(colmap, paths.database_path, paths.image_dir, paths.sparse_dir, paths.log_dir, args, init_ids)
             mode = "incremental_sfm_epipolar_refined"
+            pair_matches = refined
             match_stats = {**match_stats, "epipolar_matches_in": n_in, "epipolar_matches_kept": n_out}
         else:
             LOGGER.info("%s: epipolar refine skipped (kept %d/%d matches, %d pairs)", paths.output_name, n_out, n_in, len(refined))
 
-    extra_stats = {**match_stats, "database_export": db_stats, "mode": mode}
+    # Diagnose completeness after the normal solve, then add only one wider graph
+    # ring around failed cameras.  The existing model stays fixed while COLMAP's
+    # image_registrator gets another chance with more 2D-3D correspondences.
+    export_model_txt(colmap, model_dir, paths.model_txt_dir, paths.log_dir)
+    _cameras, initial_images, _points = read_colmap_text_model(paths.model_txt_dir)
+    initial_registered_names = {image.name for image in initial_images.values()}
+    missing_names = sorted(set(image_names) - initial_registered_names, key=natural_key)
+    rescue_pairs: list[tuple[str, str]] = []
+    rescue_matches: list[PairMatch] = []
+    rescue_db_stats: dict[str, int] | None = None
+    if missing_names:
+        LOGGER.warning(
+            "%s: registered %d/%d cameras; missing: %s",
+            paths.output_name,
+            len(initial_registered_names),
+            len(image_names),
+            ", ".join(missing_names),
+        )
+    if missing_names and args.registration_rescue:
+        rescue_pairs = build_registration_rescue_pairs(
+            image_names,
+            candidate_pairs,
+            missing_names,
+            initial_registered_names,
+            args.registration_rescue_hops,
+            args.registration_rescue_max_pairs_per_image,
+        )
+        if rescue_pairs:
+            LOGGER.info(
+                "%s: registration rescue matching %d wider-neighbour pair(s) for %d camera(s)",
+                paths.output_name,
+                len(rescue_pairs),
+                len(missing_names),
+            )
+            rescue_matches, rescue_match_stats = match_frame_pairs(
+                image_names,
+                image_infos,
+                matcher,
+                args,
+                f"{paths.output_name} rescue",
+                pairs=rescue_pairs,
+            )
+            match_stats = {
+                **match_stats,
+                **{f"registration_rescue_{key}": value for key, value in rescue_match_stats.items()},
+            }
+            if rescue_matches:
+                rescue_db_stats = append_matches_to_database(
+                    paths.database_path,
+                    image_infos,
+                    rescue_matches,
+                    args.keypoint_quantization,
+                    args.two_view_config,
+                )
+                LOGGER.info("%s: registration rescue appended %s", paths.output_name, rescue_db_stats)
+                rescued_model = paths.frame_out / "rescue_registered"
+                try:
+                    rescue_input_model = prepare_model_for_appended_keypoints(
+                        paths.model_txt_dir,
+                        paths.database_path,
+                        paths.frame_out / "rescue_input_model",
+                    )
+                    run_image_registrator(
+                        colmap,
+                        paths.database_path,
+                        rescue_input_model,
+                        rescued_model,
+                        paths.log_dir,
+                        args,
+                    )
+                    rescued_count = model_num_registered_images(rescued_model)
+                    if rescued_count > len(initial_registered_names):
+                        LOGGER.info(
+                            "%s: image registrator improved camera count %d -> %d",
+                            paths.output_name,
+                            len(initial_registered_names),
+                            rescued_count,
+                        )
+                        model_dir = rescued_model
+                        mode += "_registration_rescued"
+                    else:
+                        LOGGER.warning(
+                            "%s: image registrator did not add a camera; trying a fresh mapper solve",
+                            paths.output_name,
+                        )
+                except (CommandError, RuntimeError, ValueError) as exc:
+                    LOGGER.warning("%s: image registrator rescue failed: %s", paths.output_name, exc)
+
+                if model_num_registered_images(model_dir) == len(initial_registered_names) and args.registration_rescue_remap:
+                    remap_root = paths.frame_out / "rescue_remap"
+                    remapped_model = run_mapper(
+                        colmap,
+                        paths.database_path,
+                        paths.image_dir,
+                        remap_root,
+                        paths.log_dir,
+                        args,
+                        init_ids,
+                    )
+                    remapped_count = model_num_registered_images(remapped_model)
+                    if remapped_count >= model_num_registered_images(model_dir):
+                        model_dir = remapped_model
+                        mode += "_registration_remapped"
+            else:
+                LOGGER.warning(
+                    "%s: wider-neighbour rescue produced no valid SuperGlue/RANSAC pair",
+                    paths.output_name,
+                )
+        else:
+            LOGGER.warning(
+                "%s: no additional graph neighbours are available for registration rescue",
+                paths.output_name,
+            )
+
+    export_model_txt(colmap, model_dir, paths.model_txt_dir, paths.log_dir)
+    _cameras, final_images, _points = read_colmap_text_model(paths.model_txt_dir)
+    registered_names = {image.name for image in final_images.values()}
+    combined_matches = [*pair_matches, *rescue_matches]
+    report = write_registration_report(
+        args.output_root / "registration_report",
+        paths.output_name,
+        image_names,
+        candidate_pairs,
+        combined_matches,
+        registered_names,
+        initial_registered_names,
+        rescue_pairs,
+        rescue_matches,
+        manual_colocated_images(
+            image_names, manual_layout, getattr(args, "camera_name_mapping", None)
+        ),
+    )
+    if report["unregistered_images"]:
+        LOGGER.warning(
+            "%s: final registration %d/%d; see %s",
+            paths.output_name,
+            len(registered_names),
+            len(image_names),
+            args.output_root / "registration_report" / f"{paths.output_name}.txt",
+        )
+    else:
+        LOGGER.info("%s: all %d cameras registered", paths.output_name, len(image_names))
+
+    extra_stats = {
+        **match_stats,
+        "database_export": db_stats,
+        "registration_rescue_database_append": rescue_db_stats,
+        "num_registered_images": len(registered_names),
+        "unregistered_images": report["unregistered_images"],
+        "rescued_images": report["rescued_images"],
+        "registration_report": str(args.output_root / "registration_report" / f"{paths.output_name}.json"),
+        "mode": mode,
+    }
     return finalize_frame(model_dir, paths, frame_dir, args, colmap, extra_stats, len(staged_images), export_ctx)
 
 
@@ -3550,6 +4456,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pairs_file", type=Path, default=None)
 
     # --- Look-alike / ambiguous scene handling (auto pruning + simple user hints) ---
+    parser.add_argument(
+        "--camera_layout", "--camera-layout", dest="camera_layout", type=Path, default=None,
+        help="Camera-grid JSON or exported neighbour-pairs TXT from camera_grid_layout_tool.py. "
+             "This is the preferred manual hint for 2D/multi-camera rigs and overrides --pair_mode.",
+    )
+    parser.add_argument(
+        "--camera_layout_unlisted", "--camera-layout-unlisted",
+        dest="camera_layout_unlisted", choices=["error", "exhaustive", "ignore"], default="error",
+        help="How --camera_layout handles a current image with no manual neighbour. 'error' (default) "
+             "prevents silently losing cameras; 'exhaustive' safely pairs it with all images; 'ignore' "
+             "keeps it in COLMAP without matches.",
+    )
     parser.add_argument("--layout_file", type=Path, default=None,
                         help="Physical camera order, one name (or comma list) per line, '#' comments, "
                              "matched by stem. When given, candidate pairs are limited to cameras within "
@@ -3701,6 +4619,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mapper_abs_pose_min_num_inliers", type=int, default=20)
     parser.add_argument("--mapper_tri_min_angle", type=float, default=2.0)
     parser.add_argument("--mapper_multiple_models", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--registration_rescue",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="When COLMAP omits a camera, match it to one wider ring of already registered manual-layout "
+             "neighbours and retry registration automatically.",
+    )
+    parser.add_argument("--registration_rescue_hops", type=int, default=2,
+                        help="Manual view-graph distance used by registration rescue (2 = one extra ring).")
+    parser.add_argument("--registration_rescue_max_pairs_per_image", type=int, default=16,
+                        help="Maximum extra wider-neighbour pairs matched for each omitted camera.")
+    parser.add_argument("--registration_rescue_abs_pose_max_error", type=float, default=6.0,
+                        help="COLMAP reprojection threshold in pixels for rescue absolute-pose registration.")
+    parser.add_argument("--registration_rescue_abs_pose_min_inlier_ratio", type=float, default=0.1,
+                        help="Minimum 2D-3D inlier ratio for rescue registration; lower than COLMAP's normal "
+                             "default because manual neighbours already constrain the candidate graph.")
+    parser.add_argument("--registration_rescue_max_trials", type=int, default=10,
+                        help="Maximum COLMAP registration trials for a missing camera during rescue.")
+    parser.add_argument("--registration_rescue_remap", action=argparse.BooleanOptionalAction, default=True,
+                        help="If attaching to the existing model fails, retry a fresh mapper solve with the "
+                             "supplemental pairs.")
 
     parser.add_argument("--dense", action="store_true", help="Run image_undistorter, patch_match_stereo, stereo_fusion.")
     parser.add_argument("--gpu_index", default="0")
@@ -3738,11 +4677,40 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError("--min_inlier_ratio must be between 0 and 1")
     if args.pair_report_max < 0:
         raise ValueError("--pair_report_max cannot be negative")
+    if args.registration_rescue_hops < 2:
+        raise ValueError("--registration_rescue_hops must be at least 2")
+    if args.registration_rescue_max_pairs_per_image < 0:
+        raise ValueError("--registration_rescue_max_pairs_per_image cannot be negative")
+    if args.registration_rescue_abs_pose_max_error <= 0:
+        raise ValueError("--registration_rescue_abs_pose_max_error must be positive")
+    if not 0.0 <= args.registration_rescue_abs_pose_min_inlier_ratio <= 1.0:
+        raise ValueError("--registration_rescue_abs_pose_min_inlier_ratio must be between 0 and 1")
+    if args.registration_rescue_max_trials <= 0:
+        raise ValueError("--registration_rescue_max_trials must be positive")
     if args.pairs_file is not None:
         args.pairs_file = args.pairs_file.resolve()
+    if args.camera_layout is not None and args.layout_file is not None:
+        raise ValueError("--camera_layout and legacy --layout_file cannot be used together")
+    if args.camera_layout is not None and args.pairs_file is not None:
+        raise ValueError("--camera_layout and --pairs_file cannot be used together")
 
     # User hints for look-alike scenes: parse once, reuse everywhere (workers get them
     # via the pickled args namespace).
+    args.manual_camera_layout = (
+        load_manual_camera_layout(args.camera_layout.resolve()) if args.camera_layout else None
+    )
+    if args.manual_camera_layout is not None:
+        manual = args.manual_camera_layout
+        settings = (
+            f", {manual.neighbour_mode}-neighbour radius={manual.neighbour_radius}"
+            if manual.neighbour_mode is not None else ""
+        )
+        LOGGER.info(
+            "camera layout: %s (%d cameras, %d placed, %d pairs%s)",
+            manual.source_path, len(manual.camera_ids), len(manual.placed_ids), len(manual.pairs), settings,
+        )
+        if args.pair_mode != "exhaustive":
+            LOGGER.warning("--pair_mode=%s is ignored because --camera_layout is active", args.pair_mode)
     args.layout_order = load_layout_file(args.layout_file.resolve()) if args.layout_file else None
     if args.layout_order:
         LOGGER.info(
@@ -3768,6 +4736,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     else:
         frame_dirs = discover_frame_dirs(args.images_root)
+    args.camera_name_mapping = camera_mapping
     selected_frames = parse_frame_selection(frame_dirs, args.frames)
     args.output_root.mkdir(parents=True, exist_ok=True)
 
@@ -3828,8 +4797,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         LOGGER.info("static rig: reference registered %d/%d cameras", len(ref_pose_by_name), ref_stats["num_images"])
 
         fixed_pairs = None
-        if args.rig_pair_mode == "covisibility":
-            ref_names = sorted(ref_pose_by_name, key=natural_key)
+        ref_names = sorted(ref_pose_by_name, key=natural_key)
+        if args.manual_camera_layout is not None:
+            fixed_pairs = build_manual_camera_pairs(
+                ref_names,
+                args.manual_camera_layout,
+                args.camera_name_mapping,
+                args.camera_layout_unlisted,
+            )
+            full = len(ref_names) * (len(ref_names) - 1) // 2
+            LOGGER.info(
+                "static rig: reusing %d manual layout pairs for every frame "
+                "(exhaustive would be %d)",
+                len(fixed_pairs), full,
+            )
+        elif args.rig_pair_mode == "covisibility":
             fixed_pairs = build_rig_pairs(
                 ref_images, ref_points, ref_names,
                 args.rig_covis_top_k, args.rig_covis_min_shared, args.rig_geo_neighbors,
